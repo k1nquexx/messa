@@ -1,0 +1,45 @@
+# Зависимости и пакеты
+node_modules/
+package-lock.json
+
+# Данные сервера и очереди сообщений
+data/
+data/offline_queue/
+server/data/
+
+# Логи и временные файлы
+*.log
+crash.log
+startup.log
+exit.log
+dispatcher_error.log
+domain_error.log
+*.tmp
+*.pdb
+
+# Сборки Android и кэш Gradle
+.gradle/
+**/build/
+**/bin/
+**/obj/
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/capacitor-cordova-android-plugins/build/
+mobile/android/local.properties
+mobile/android/.idea/
+
+# Скомпилированные бинарники (по желанию, раскомментируй если не хочешь хранить exe/apk в git)
+# *.exe
+# *.apk
+
+# Локальные профили, ключи шифрования и базы сообщений (Private)
+identity_*.json
+messages_*.json
+contacts_*.json
+server_settings.json
+
+# Системные файлы ОС
+.DS_Store
+Thumbs.db
+desktop.ini

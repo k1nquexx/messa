@@ -1,0 +1,21 @@
+{
+  "name": "sovereign-messenger",
+  "version": "1.0.0",
+  "description": "Защищенный E2EE мессенджер с нулевым разглашением (Zero-Knowledge) и автономным интерфейсом.",
+  "main": "test_scenario.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/cli": "^8.6.0",
+    "@capacitor/core": "^8.6.0",
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.4",
+    "qrcode-generator": "^2.0.4"
+  }
+}
