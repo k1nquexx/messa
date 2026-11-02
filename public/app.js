@@ -19,6 +19,7 @@
     const STORAGE_KEY_DRAFTS = `cipher_drafts_${currentUserProfile}`;
     const STORAGE_KEY_SERVER_URL = 'cipher_server_url';
     const STORAGE_KEY_SERVER_SECRET = 'cipher_server_secret';
+    const DEFAULT_SERVER_URL = 'ws://185.219.7.51';
 
     // ==============================================================================
     // INDEXEDDB STORAGE ENGINE (GIGABYTES CAPACITY FOR PHOTOS/VOICE - NO 5MB LIMIT)
@@ -464,20 +465,10 @@
     // 4. Определение WebSocket адреса
     function getOptimalWsUrl() {
         let saved = localStorage.getItem(STORAGE_KEY_SERVER_URL);
-        if (saved && saved.trim() && !saved.includes('localhost') && !saved.includes('127.0.0.1')) {
-            saved = saved.trim();
-            if (saved.startsWith('http://')) return saved.replace(/^http:\/\//, 'ws://');
-            if (saved.startsWith('https://')) return saved.replace(/^https:\/\//, 'wss://');
-            if (!saved.startsWith('ws://') && !saved.startsWith('wss://')) return 'wss://' + saved;
-            return saved;
-        }
-
-        if (serverTunnelUrl) {
-            return serverTunnelUrl;
-        }
-
-        if (window.location.protocol === 'https:' && window.location.host && !window.location.host.includes('localhost')) {
-            return `wss://${window.location.host}`;
+        // Если сохранен старый недействительный временный туннель Cloudflare или localhost на мобилке — очищаем его!
+        if (saved && (saved.includes('trycloudflare.com') || (window.location.protocol === 'http:' && (saved.includes('127.0.0.1') || saved.includes('localhost'))))) {
+            localStorage.removeItem(STORAGE_KEY_SERVER_URL);
+            saved = null;
         }
 
         if (saved && saved.trim()) {
@@ -488,7 +479,19 @@
             return saved;
         }
 
-        return 'ws://127.0.0.1:8080';
+        if (serverTunnelUrl && !serverTunnelUrl.includes('trycloudflare.com')) {
+            return serverTunnelUrl;
+        }
+
+        if (window.location.protocol === 'https:' && window.location.host && !window.location.host.includes('localhost')) {
+            return `wss://${window.location.host}`;
+        }
+
+        if (window.location.protocol === 'http:' && window.location.host && !window.location.host.includes('localhost') && !window.location.host.includes('127.0.0.1')) {
+            return `ws://${window.location.host}`;
+        }
+
+        return DEFAULT_SERVER_URL;
     }
 
     // 5. Подключение к релей-серверу (с защитой от утечек соединений и повторных сокетов)
@@ -1422,8 +1425,9 @@
             const dur = Math.round(msg.voice.duration || 0);
             voiceHtml = `
                 <div class="voice-note-player" id="voice_player_${msg.id}">
-                    <button type="button" class="voice-play-btn" onclick="playVoiceNote('${msg.id}', '${msg.voice.data}')" id="voice_btn_${msg.id}">
-                        ▶
+                    <button type="button" class="voice-play-btn" onclick="playVoiceNote('${msg.id}', '${msg.voice.data}')" id="voice_btn_${msg.id}" aria-label="Воспроизвести">
+                        <svg class="voice-icon-play" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M8 5.14v14l11-7-11-7z"/></svg>
+                        <svg class="voice-icon-pause" viewBox="0 0 24 24" width="16" height="16" fill="currentColor" style="display:none;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
                     </button>
                     <div class="voice-track-info">
                         <div class="voice-progress-bar" onclick="seekVoiceTrack(event, '${msg.id}')">
@@ -1431,7 +1435,7 @@
                         </div>
                         <div class="voice-meta-row">
                             <span id="voice_cur_${msg.id}">0:00</span>
-                            <div style="display:flex;align-items:center;gap:6px;">
+                            <div class="voice-right-meta">
                                 <span>${formatAudioTime(dur)}</span>
                                 <button type="button" class="voice-speed-btn" onclick="cycleVoiceSpeed('${msg.id}', event)" id="speed_${msg.id}">1x</button>
                             </div>
@@ -1684,36 +1688,36 @@
 
     function startVoiceRecording(stream) {
         audioStream = stream;
-        recordedPcmBuffers = [];
         audioChunks = [];
 
-        try {
-            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-            audioContext = new AudioContextClass();
-            audioSourceNode = audioContext.createMediaStreamSource(stream);
-            audioProcessorNode = audioContext.createScriptProcessor(4096, 1, 1);
-            audioProcessorNode.onaudioprocess = (e) => {
-                const channelData = e.inputBuffer.getChannelData(0);
-                recordedPcmBuffers.push(new Float32Array(channelData));
-            };
-            audioSourceNode.connect(audioProcessorNode);
-            audioProcessorNode.connect(audioContext.destination);
-        } catch (e) {
-            let mimeType = 'audio/webm;codecs=opus';
-            if (!MediaRecorder.isTypeSupported(mimeType)) {
-                mimeType = 'audio/ogg;codecs=opus';
-                if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = '';
+        let mimeType = '';
+        const candidateTypes = [
+            'audio/webm;codecs=opus',
+            'audio/webm',
+            'audio/ogg;codecs=opus',
+            'audio/mp4',
+            'audio/aac'
+        ];
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported) {
+            for (const t of candidateTypes) {
+                if (MediaRecorder.isTypeSupported(t)) {
+                    mimeType = t;
+                    break;
+                }
             }
-            try {
-                mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-            } catch {
-                mediaRecorder = new MediaRecorder(stream);
-            }
-            mediaRecorder.ondataavailable = (ev) => {
-                if (ev.data && ev.data.size > 0) audioChunks.push(ev.data);
-            };
-            mediaRecorder.start(100);
         }
+
+        try {
+            mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+        } catch {
+            mediaRecorder = new MediaRecorder(stream);
+        }
+
+        mediaRecorder.ondataavailable = (ev) => {
+            if (ev.data && ev.data.size > 0) audioChunks.push(ev.data);
+        };
+
+        mediaRecorder.start(100);
 
         // Переключение интерфейса в режим записи
         elChatInputArea.style.display = 'none';
@@ -1721,6 +1725,7 @@
 
         voiceRecordingSeconds = 0;
         updateVoiceRecTimer();
+        if (voiceRecordingTimer) clearInterval(voiceRecordingTimer);
         voiceRecordingTimer = setInterval(() => {
             voiceRecordingSeconds++;
             updateVoiceRecTimer();
@@ -1734,18 +1739,6 @@
     }
 
     function stopVoiceRecordingStreams() {
-        if (audioProcessorNode) {
-            try { audioProcessorNode.disconnect(); } catch {}
-            audioProcessorNode = null;
-        }
-        if (audioSourceNode) {
-            try { audioSourceNode.disconnect(); } catch {}
-            audioSourceNode = null;
-        }
-        if (audioContext) {
-            try { audioContext.close(); } catch {}
-            audioContext = null;
-        }
         if (mediaRecorder && mediaRecorder.state === 'recording') {
             try { mediaRecorder.stop(); } catch {}
         }
@@ -1764,52 +1757,85 @@
     if (elBtnCancelVoice) {
         elBtnCancelVoice.onclick = () => {
             stopVoiceRecordingStreams();
-            recordedPcmBuffers = [];
             audioChunks = [];
         };
     }
 
     if (elBtnSendVoice) {
         elBtnSendVoice.onclick = () => {
-            const duration = voiceRecordingSeconds;
-            if (recordedPcmBuffers.length > 0 && audioContext) {
-                const sampleRate = audioContext.sampleRate || 44100;
-                const wavBlob = encodeWavBlob(recordedPcmBuffers, sampleRate);
-                const reader = new FileReader();
-                reader.onload = () => {
+            const duration = Math.max(1, voiceRecordingSeconds);
+            if (!mediaRecorder || mediaRecorder.state !== 'recording') {
+                stopVoiceRecordingStreams();
+                return;
+            }
+
+            mediaRecorder.onstop = async () => {
+                try {
+                    const rawBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                    let wavDataUrl = null;
+
+                    // Всегда декодируем запись в 16-битный PCM WAV,
+                    // который гарантированно без сторонних кодеков играет на Windows ПК (CIPHER.exe), Android и Web!
+                    try {
+                        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                        if (AudioContextClass) {
+                            const actx = new AudioContextClass();
+                            if (actx.state === 'suspended') await actx.resume();
+                            const arrayBuf = await rawBlob.arrayBuffer();
+                            const audioBuf = await actx.decodeAudioData(arrayBuf);
+                            const channelData = audioBuf.getChannelData(0);
+                            const wavBlob = encodeWavBlob([channelData], audioBuf.sampleRate);
+                            wavDataUrl = await new Promise((res, rej) => {
+                                const r = new FileReader();
+                                r.onload = () => res(r.result);
+                                r.onerror = rej;
+                                r.readAsDataURL(wavBlob);
+                            });
+                            try { actx.close(); } catch {}
+                        }
+                    } catch (convErr) {
+                        console.warn('[VOICE] PCM decode failed, fallback to raw format:', convErr);
+                    }
+
+                    if (!wavDataUrl) {
+                        wavDataUrl = await new Promise((res, rej) => {
+                            const r = new FileReader();
+                            r.onload = () => res(r.result);
+                            r.onerror = rej;
+                            r.readAsDataURL(rawBlob);
+                        });
+                    }
+
                     sendMessage('', {
-                        data: reader.result,
+                        data: wavDataUrl,
                         duration: duration
                     });
-                };
-                reader.readAsDataURL(wavBlob);
-                stopVoiceRecordingStreams();
-            } else if (mediaRecorder && mediaRecorder.state === 'recording') {
-                mediaRecorder.onstop = () => {
-                    const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                        sendMessage('', {
-                            data: reader.result,
-                            duration: duration
-                        });
-                    };
-                    reader.readAsDataURL(blob);
+                } catch (err) {
+                    console.error('[VOICE SEND ERROR]', err);
+                } finally {
                     stopVoiceRecordingStreams();
-                };
-                mediaRecorder.stop();
-            } else {
-                stopVoiceRecordingStreams();
-            }
+                }
+            };
+
+            mediaRecorder.stop();
         };
+    }
+
+    function updateVoicePlayBtnUi(msgId, isPlaying) {
+        const btn = document.getElementById(`voice_btn_${msgId}`);
+        if (!btn) return;
+        const playIcon = btn.querySelector('.voice-icon-play');
+        const pauseIcon = btn.querySelector('.voice-icon-pause');
+        if (playIcon) playIcon.style.display = isPlaying ? 'none' : 'block';
+        if (pauseIcon) pauseIcon.style.display = isPlaying ? 'block' : 'none';
     }
 
     // Воспроизведение голосовых сообщений
     window.playVoiceNote = function (msgId, audioSrc) {
+        if (!audioSrc) return;
         if (!audioSrc.startsWith('data:') && !audioSrc.startsWith('http') && !audioSrc.startsWith('blob:')) {
             audioSrc = 'data:audio/wav;base64,' + audioSrc;
         }
-        const btn = document.getElementById(`voice_btn_${msgId}`);
         const fill = document.getElementById(`voice_fill_${msgId}`);
         const curTimeEl = document.getElementById(`voice_cur_${msgId}`);
 
@@ -1817,16 +1843,15 @@
             if (activeAudioPlayer.dataset.msgId === msgId) {
                 if (activeAudioPlayer.paused) {
                     activeAudioPlayer.play();
-                    if (btn) btn.textContent = '⏸';
+                    updateVoicePlayBtnUi(msgId, true);
                 } else {
                     activeAudioPlayer.pause();
-                    if (btn) btn.textContent = '▶';
+                    updateVoicePlayBtnUi(msgId, false);
                 }
                 return;
             } else {
                 activeAudioPlayer.pause();
-                const oldBtn = document.getElementById(`voice_btn_${activeAudioPlayer.dataset.msgId}`);
-                if (oldBtn) oldBtn.textContent = '▶';
+                updateVoicePlayBtnUi(activeAudioPlayer.dataset.msgId, false);
             }
         }
 
@@ -1848,16 +1873,17 @@
         };
 
         audio.onended = () => {
-            if (btn) btn.textContent = '▶';
+            updateVoicePlayBtnUi(msgId, false);
             if (fill) fill.style.width = '0%';
             if (curTimeEl) curTimeEl.textContent = '0:00';
             activeAudioPlayer = null;
         };
 
         audio.play().then(() => {
-            if (btn) btn.textContent = '⏸';
+            updateVoicePlayBtnUi(msgId, true);
         }).catch(err => {
             console.error('Ошибка воспроизведения аудио:', err);
+            updateVoicePlayBtnUi(msgId, false);
         });
     };
 
