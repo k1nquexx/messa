@@ -18,6 +18,7 @@ using Avalonia.Media;
 using Avalonia.Threading;
 using Messa.Core.Crypto;
 using Messa.Core.Models;
+using Messa.Core.Storage;
 
 namespace Messa.Desktop
 {
@@ -45,6 +46,11 @@ namespace Messa.Desktop
         private readonly string _profileFile;
         private readonly string _contactsFile;
         private readonly string _settingsFile;
+        private readonly string _dbPath;
+
+        // SQLCipher Encrypted Database & Media Cache
+        private readonly EncryptedLocalDatabase _localDb;
+        private readonly MediaCacheManager _mediaCache;
 
         // Telegram-style Multi-Device PTS State
         private readonly string _deviceId = $"desktop-{Environment.MachineName}";
@@ -63,17 +69,27 @@ namespace Messa.Desktop
             _profileFile = Path.Combine(_appDataDir, "profile.json");
             _contactsFile = Path.Combine(_appDataDir, "contacts.json");
             _settingsFile = Path.Combine(_appDataDir, "settings.json");
+            _dbPath = Path.Combine(_appDataDir, "messa_encrypted.db");
 
             MessagesList.ItemsSource = _messages;
             ContactsList.ItemsSource = _contacts;
 
             _myKey = LoadOrCreateIdentity();
             _myProfile = LoadOrCreateProfile();
+
+            // Initialize SQLCipher encrypted database with user's private key
+            var keyMaterial = Convert.FromBase64String(_myKey.SigningPrivateKeyBase64);
+            _localDb = new EncryptedLocalDatabase(_dbPath, keyMaterial);
+
+            // Initialize Media Cache with 7-day retention policy (Telegram style)
+            _mediaCache = new MediaCacheManager(Path.Combine(_appDataDir, "cache"));
+            _mediaCache.PurgeExpiredMedia(CacheRetentionPolicy.Days7);
+
             LoadContacts();
             LoadSettings();
 
             UpdateProfileUI();
-            AddSystemMessage("Sovereign Native Engine ready. Multi-Device PTS Cloud Sync enabled.");
+            AddSystemMessage("Sovereign Native Engine ready. SQLCipher Encrypted DB & Multi-Device PTS active.");
         }
 
         private IdentityKey LoadOrCreateIdentity()
@@ -326,7 +342,7 @@ namespace Messa.Desktop
                             {
                                 foreach (var msg in packet.Difference)
                                 {
-                                    ApplyCloudMessage(msg);
+                                    ApplyAndPersistCloudMessage(msg);
                                 }
                                 if (packet.CurrentPts.HasValue)
                                 {
@@ -343,7 +359,7 @@ namespace Messa.Desktop
                         case "new_message":
                             if (packet.CloudMessage != null)
                             {
-                                ApplyCloudMessage(packet.CloudMessage);
+                                ApplyAndPersistCloudMessage(packet.CloudMessage);
                                 if (packet.Pts.HasValue && packet.Pts.Value > _localPts)
                                 {
                                     _localPts = packet.Pts.Value;
@@ -371,12 +387,24 @@ namespace Messa.Desktop
             }
         }
 
-        private void ApplyCloudMessage(CloudMessage msg)
+        private void ApplyAndPersistCloudMessage(CloudMessage msg)
         {
             var peerFp = msg.PeerFingerprint;
             var contact = _contacts.FirstOrDefault(c => c.Fingerprint.Equals(peerFp, StringComparison.OrdinalIgnoreCase));
-
             var displayText = !string.IsNullOrEmpty(msg.Text) ? msg.Text : "[Encrypted Payload]";
+
+            // Persist to local SQLCipher Encrypted Database
+            _localDb.SaveMessage(new LocalMessageRecord
+            {
+                Id = msg.Id,
+                ChatId = peerFp,
+                SenderId = msg.SenderFingerprint,
+                IsOutgoing = msg.IsOutgoing,
+                Pts = msg.Pts,
+                Timestamp = msg.Timestamp,
+                PlainText = displayText,
+                Signature = msg.SignatureBase64
+            });
 
             if (contact != null)
             {
@@ -385,34 +413,38 @@ namespace Messa.Desktop
                 SaveContacts();
             }
 
-            Dispatcher.UIThread.Post(() =>
+            // Only append to active view if it belongs to current active chat
+            if (_activeContact != null && _activeContact.Fingerprint.Equals(peerFp, StringComparison.OrdinalIgnoreCase))
             {
-                if (msg.IsOutgoing)
+                Dispatcher.UIThread.Post(() =>
                 {
-                    _messages.Add(new ChatMessage
+                    if (msg.IsOutgoing)
                     {
-                        Header = "Me (synced)",
-                        Text = displayText,
-                        Time = DateTimeOffset.FromUnixTimeMilliseconds(msg.Timestamp).LocalDateTime.ToString("HH:mm"),
-                        StatusBadge = $"PTS #{msg.Pts} • Cloud Synced",
-                        BackgroundColor = new SolidColorBrush(Color.Parse("#2563EB")),
-                        Alignment = HorizontalAlignment.Right
-                    });
-                }
-                else
-                {
-                    var senderName = contact?.DisplayName ?? msg.SenderFingerprint[..8];
-                    _messages.Add(new ChatMessage
+                        _messages.Add(new ChatMessage
+                        {
+                            Header = "Me (synced)",
+                            Text = displayText,
+                            Time = DateTimeOffset.FromUnixTimeMilliseconds(msg.Timestamp).LocalDateTime.ToString("HH:mm"),
+                            StatusBadge = $"PTS #{msg.Pts} • Encrypted DB",
+                            BackgroundColor = new SolidColorBrush(Color.Parse("#2563EB")),
+                            Alignment = HorizontalAlignment.Right
+                        });
+                    }
+                    else
                     {
-                        Header = senderName,
-                        Text = displayText,
-                        Time = DateTimeOffset.FromUnixTimeMilliseconds(msg.Timestamp).LocalDateTime.ToString("HH:mm"),
-                        StatusBadge = $"PTS #{msg.Pts} • Verified",
-                        BackgroundColor = new SolidColorBrush(Color.Parse("#1F2937")),
-                        Alignment = HorizontalAlignment.Left
-                    });
-                }
-            });
+                        var senderName = contact?.DisplayName ?? msg.SenderFingerprint[..8];
+                        _messages.Add(new ChatMessage
+                        {
+                            Header = senderName,
+                            Text = displayText,
+                            Time = DateTimeOffset.FromUnixTimeMilliseconds(msg.Timestamp).LocalDateTime.ToString("HH:mm"),
+                            StatusBadge = $"PTS #{msg.Pts} • Encrypted DB",
+                            BackgroundColor = new SolidColorBrush(Color.Parse("#1F2937")),
+                            Alignment = HorizontalAlignment.Left
+                        });
+                    }
+                });
+            }
         }
 
         private async void OnContactSelectionChanged(object? sender, SelectionChangedEventArgs e)
@@ -422,7 +454,23 @@ namespace Messa.Desktop
                 _activeContact = contact;
                 ActivePeerNameText.Text = $"{contact.DisplayName} (@{contact.Username.TrimStart('@')})";
                 ActivePeerInitial.Text = string.IsNullOrEmpty(contact.DisplayName) ? "?" : contact.DisplayName[0].ToString().ToUpper();
-                ActivePeerDetailsText.Text = $"ID: {contact.Fingerprint[..16]}... • Multi-Device Cloud Sync";
+                ActivePeerDetailsText.Text = $"ID: {contact.Fingerprint[..16]}... • SQLCipher Encrypted DB";
+
+                // Load persistent message history from Encrypted SQLite database!
+                _messages.Clear();
+                var savedHistory = _localDb.GetMessagesForChat(contact.Fingerprint);
+                foreach (var rec in savedHistory)
+                {
+                    _messages.Add(new ChatMessage
+                    {
+                        Header = rec.IsOutgoing ? "Me" : contact.DisplayName,
+                        Text = rec.PlainText,
+                        Time = DateTimeOffset.FromUnixTimeMilliseconds(rec.Timestamp).LocalDateTime.ToString("HH:mm"),
+                        StatusBadge = $"PTS #{rec.Pts} • Encrypted DB",
+                        BackgroundColor = rec.IsOutgoing ? new SolidColorBrush(Color.Parse("#2563EB")) : new SolidColorBrush(Color.Parse("#1F2937")),
+                        Alignment = rec.IsOutgoing ? HorizontalAlignment.Right : HorizontalAlignment.Left
+                    });
+                }
 
                 if (!_sessions.ContainsKey(contact.Fingerprint) && _webSocket != null && _webSocket.State == WebSocketState.Open)
                 {
@@ -447,6 +495,15 @@ namespace Messa.Desktop
         {
             var search = ContactSearchBox.Text?.Trim();
             if (string.IsNullOrEmpty(search)) return;
+
+            // Search messages in local encrypted DB if prefixed with find: or search:
+            if (search.StartsWith("find:", StringComparison.OrdinalIgnoreCase) || search.StartsWith("search:", StringComparison.OrdinalIgnoreCase))
+            {
+                var q = search.Substring(search.IndexOf(':') + 1).Trim();
+                var ftsResults = _localDb.SearchMessages(q, _activeContact?.Fingerprint);
+                AddSystemMessage($"FTS Search for '{q}': found {ftsResults.Count} matching message(s).");
+                return;
+            }
 
             var linkContact = ContactCard.FromInviteLink(search);
             if (linkContact != null)
@@ -538,21 +595,39 @@ namespace Messa.Desktop
 
             try
             {
-                // Send via multi-device cloud sync
+                var msgId = Guid.NewGuid().ToString("N");
+                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                // 1. Send via Multi-Device Cloud Sync
                 var sendPacket = new ProtocolPacket
                 {
                     Type = "send_message",
                     Query = _activeContact.Fingerprint,
                     CloudMessage = new CloudMessage
                     {
+                        Id = msgId,
                         PeerFingerprint = _activeContact.Fingerprint,
                         SenderFingerprint = _myKey.Fingerprint,
-                        Text = text
+                        Text = text,
+                        Timestamp = now
                     }
                 };
-
                 await SendJsonAsync(sendPacket);
 
+                // 2. Persist to local SQLCipher Encrypted Database immediately
+                _localDb.SaveMessage(new LocalMessageRecord
+                {
+                    Id = msgId,
+                    ChatId = _activeContact.Fingerprint,
+                    SenderId = _myKey.Fingerprint,
+                    IsOutgoing = true,
+                    Pts = ++_localPts,
+                    Timestamp = now,
+                    PlainText = text
+                });
+                SaveSettings();
+
+                // 3. Update active contact preview
                 _activeContact.LastMessagePreview = $"You: {text}";
                 _activeContact.LastMessageTime = DateTime.Now.ToString("HH:mm");
                 SaveContacts();
@@ -562,7 +637,7 @@ namespace Messa.Desktop
                     Header = "Me",
                     Text = text,
                     Time = DateTime.Now.ToString("HH:mm"),
-                    StatusBadge = "Sent • Cloud Synced",
+                    StatusBadge = "Saved in Encrypted DB",
                     BackgroundColor = new SolidColorBrush(Color.Parse("#2563EB")),
                     Alignment = HorizontalAlignment.Right
                 });
@@ -634,6 +709,12 @@ namespace Messa.Desktop
                 BackgroundColor = new SolidColorBrush(Color.Parse("#111827")),
                 Alignment = HorizontalAlignment.Center
             });
+        }
+
+        protected override void OnClosing(WindowClosingEventArgs e)
+        {
+            _localDb?.Dispose();
+            base.OnClosing(e);
         }
     }
 }
