@@ -1382,7 +1382,7 @@ namespace CipherNative
                 string displayAddr = "127.0.0.1:8080";
                 try
                 {
-                    string u = !string.IsNullOrEmpty(identity.ServerUrl) ? identity.ServerUrl : "ws://185.219.7.51";
+                    string u = !string.IsNullOrEmpty(identity.ServerUrl) ? identity.ServerUrl : "wss://fotowaqu.ru";
                     var uri = new Uri(u);
                     displayAddr = uri.Authority;
                 }
@@ -1710,7 +1710,7 @@ window.onload = function() {
             panel.Children.Add(new TextBlock { Text = "Адрес релей-сервера (ws:// или wss://):", Foreground = Brushes.White, FontSize = 12, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 4) });
             var txtUrl = new TextBox
             {
-                Text = !string.IsNullOrEmpty(identity.ServerUrl) ? identity.ServerUrl : "ws://185.219.7.51",
+                Text = !string.IsNullOrEmpty(identity.ServerUrl) ? identity.ServerUrl : "wss://fotowaqu.ru",
                 Background = BrushInputBox,
                 Foreground = Brushes.White,
                 Padding = new Thickness(8),
@@ -2955,7 +2955,7 @@ window.onload = function() {
                     UpdateServerFooterText();
                 }));
 
-                string sUrl = !string.IsNullOrEmpty(identity.ServerUrl) ? identity.ServerUrl.Trim() : "ws://185.219.7.51";
+                string sUrl = !string.IsNullOrEmpty(identity.ServerUrl) ? identity.ServerUrl.Trim() : "wss://fotowaqu.ru";
                 if (!sUrl.StartsWith("ws://") && !sUrl.StartsWith("wss://"))
                 {
                     sUrl = "ws://" + sUrl;

@@ -19,7 +19,7 @@
     const STORAGE_KEY_DRAFTS = `cipher_drafts_${currentUserProfile}`;
     const STORAGE_KEY_SERVER_URL = 'cipher_server_url';
     const STORAGE_KEY_SERVER_SECRET = 'cipher_server_secret';
-    const DEFAULT_SERVER_URL = 'ws://185.219.7.51';
+    const DEFAULT_SERVER_URL = 'wss://fotowaqu.ru';
 
     // ==============================================================================
     // INDEXEDDB STORAGE ENGINE (GIGABYTES CAPACITY FOR PHOTOS/VOICE - NO 5MB LIMIT)
