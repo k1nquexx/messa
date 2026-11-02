@@ -3,78 +3,127 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="using:Messa.Desktop"
-        mc:Ignorable="d" d:DesignWidth="980" d:DesignHeight="720"
+        xmlns:models="using:Messa.Core.Models"
+        mc:Ignorable="d" d:DesignWidth="1100" d:DesignHeight="750"
         x:Class="Messa.Desktop.MainWindow"
-        Title="MESSA - Double Ratchet Native Messenger"
-        Width="1000" Height="740"
+        Title="MESSA - Sovereign Messenger"
+        Width="1140" Height="780"
         WindowStartupLocation="CenterScreen"
-        Background="#0E121A">
+        Background="#0B0E14">
 
-    <Grid RowDefinitions="Auto, Auto, Auto, *, Auto" Margin="20">
-        <!-- Top Navigation / Connection Bar -->
-        <Border Grid.Row="0" Background="#161C26" CornerRadius="10" Padding="14" Margin="0,0,0,12">
-            <Grid ColumnDefinitions="Auto, *, Auto">
-                <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
-                    <TextBlock Text="🛡️ MESSA" FontSize="20" FontWeight="Bold" Foreground="#4A90E2"/>
-                    <TextBlock Text="Signal Double Ratchet • ECDSA • Native Skia" FontSize="12" VerticalAlignment="Center" Foreground="#7A889B"/>
-                </StackPanel>
-
-                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
-                    <Ellipse x:Name="StatusDot" Width="10" Height="10" Fill="#FF4D4D"/>
-                    <TextBlock x:Name="StatusText" Text="Disconnected" Foreground="#7A889B" VerticalAlignment="Center"/>
-                    <TextBox x:Name="ServerUrlBox" Text="wss://fotowaqu.ru" Width="190" VerticalAlignment="Center"/>
-                    <Button x:Name="ConnectBtn" Content="Connect" Click="OnConnectClicked" Background="#2B5278" Foreground="White"/>
-                </StackPanel>
-            </Grid>
-        </Border>
-
-        <!-- Identity & Profile Bar -->
-        <Border Grid.Row="1" Background="#161C26" CornerRadius="10" Padding="14" Margin="0,0,0,12">
-            <Grid ColumnDefinitions="Auto, 160, Auto, *, Auto">
-                <TextBlock Text="Username:" FontWeight="SemiBold" Foreground="#A0AAB8" VerticalAlignment="Center" Margin="0,0,10,0"/>
-                <TextBox Grid.Column="1" x:Name="UsernameBox" Watermark="e.g. alice" Margin="0,0,14,0"/>
-
-                <TextBlock Grid.Column="2" Text="Fingerprint:" FontWeight="SemiBold" Foreground="#A0AAB8" VerticalAlignment="Center" Margin="0,0,10,0"/>
-                <TextBox Grid.Column="3" x:Name="MyFingerprintBox" IsReadOnly="True" Background="#0E121A" Foreground="#64B5F6" FontFamily="Consolas, monospace" FontSize="12"/>
-
-                <Button Grid.Column="4" Content="Publish to Directory" Click="OnPublishProfileClicked" Margin="10,0,0,0" Background="#1E3A5F" Foreground="#64B5F6"/>
-            </Grid>
-        </Border>
-
-        <!-- Recipient Lookup & Session Init (No more manual Base64 copy-paste!) -->
-        <Border Grid.Row="2" Background="#161C26" CornerRadius="10" Padding="14" Margin="0,0,0,12">
-            <Grid ColumnDefinitions="Auto, *, Auto, Auto">
-                <TextBlock Text="Start Chat:" FontWeight="SemiBold" Foreground="#A0AAB8" VerticalAlignment="Center" Margin="0,0,10,0"/>
-                <TextBox Grid.Column="1" x:Name="PeerSearchBox" Watermark="Enter @username or 64-char fingerprint (e.g. @bob)" Margin="0,0,10,0"/>
-                <Button Grid.Column="2" Content="Find &amp; Init Ratchet" Click="OnInitRatchetClicked" Background="#3B82F6" Foreground="White" FontWeight="SemiBold"/>
-                <TextBlock Grid.Column="3" x:Name="ActivePeerLabel" Text="No active contact" Foreground="#9CA3AF" VerticalAlignment="Center" Margin="14,0,0,0"/>
-            </Grid>
-        </Border>
-
-        <!-- Main Chat Area -->
-        <Border Grid.Row="3" Background="#161C26" CornerRadius="10" Padding="14">
-            <ListBox x:Name="MessagesList" Background="#0E121A" CornerRadius="8" Padding="10">
-                <ListBox.ItemTemplate>
-                    <DataTemplate x:DataType="local:ChatMessage">
-                        <Border Background="{Binding BackgroundColor}" CornerRadius="8" Padding="12" Margin="4,4,4,4" MaxWidth="640" HorizontalAlignment="{Binding Alignment}">
-                            <StackPanel Spacing="5">
-                                <Grid ColumnDefinitions="*, Auto">
-                                    <TextBlock Text="{Binding Header}" FontSize="11" Foreground="#93C5FD" FontWeight="Bold"/>
-                                    <TextBlock Grid.Column="1" Text="{Binding StatusBadge}" FontSize="10" Foreground="#34D399" Margin="10,0,0,0"/>
-                                </Grid>
-                                <TextBlock Text="{Binding Text}" FontSize="14" Foreground="White" TextWrapping="Wrap"/>
-                                <TextBlock Text="{Binding Time}" FontSize="10" Foreground="#6B7280" HorizontalAlignment="Right"/>
-                            </StackPanel>
+    <Grid ColumnDefinitions="320, *">
+        <!-- LEFT SIDEBAR: PROFILE & CONTACTS -->
+        <Border Grid.Column="0" Background="#121721" BorderBrush="#1F2937" BorderThickness="0,0,1,0">
+            <Grid RowDefinitions="Auto, Auto, Auto, *, Auto">
+                <!-- My Profile Header -->
+                <Border Grid.Row="0" Background="#18202D" Padding="14" Margin="10,10,10,6" CornerRadius="10">
+                    <Grid ColumnDefinitions="Auto, *, Auto">
+                        <Border Width="44" Height="44" CornerRadius="22" Background="#2B5278" HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <TextBlock x:Name="MyAvatarInitial" Text="A" FontSize="18" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Border>
-                    </DataTemplate>
-                </ListBox.ItemTemplate>
-            </ListBox>
+
+                        <StackPanel Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center">
+                            <TextBlock x:Name="MyDisplayNameText" Text="Alice" FontWeight="Bold" FontSize="15" Foreground="White"/>
+                            <TextBlock x:Name="MyUsernameText" Text="@alice" FontSize="12" Foreground="#60A5FA"/>
+                        </StackPanel>
+
+                        <Button Grid.Column="2" Content="⚙️" Click="OnEditProfileClicked" Background="Transparent" Foreground="#9CA3AF" FontSize="16" Padding="6,2"/>
+                    </Grid>
+                </Border>
+
+                <!-- Server Connection Strip -->
+                <Border Grid.Row="1" Background="#18202D" Padding="10" Margin="10,0,10,6" CornerRadius="8">
+                    <Grid ColumnDefinitions="Auto, *, Auto">
+                        <Ellipse x:Name="StatusDot" Width="9" Height="9" Fill="#EF4444" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBox Grid.Column="1" x:Name="ServerUrlBox" Text="wss://fotowaqu.ru" FontSize="11" Height="28" VerticalContentAlignment="Center" Background="#0B0E14" Foreground="#9CA3AF"/>
+                        <Button Grid.Column="2" x:Name="ConnectBtn" Content="Connect" Click="OnConnectClicked" Margin="6,0,0,0" Background="#2563EB" Foreground="White" FontSize="11" Height="28" Padding="10,0"/>
+                    </Grid>
+                </Border>
+
+                <!-- Search & Add Contact Bar -->
+                <Grid Grid.Row="2" ColumnDefinitions="*, Auto" Margin="10,4,10,8">
+                    <TextBox Grid.Column="0" x:Name="ContactSearchBox" Watermark="Search contacts or @username..." Height="34" VerticalContentAlignment="Center" KeyDown="OnSearchKeyDown"/>
+                    <Button Grid.Column="1" Content="+ Add" Click="OnAddContactClicked" Margin="6,0,0,0" Background="#3B82F6" Foreground="White" FontWeight="SemiBold" Height="34" Padding="12,0"/>
+                </Grid>
+
+                <!-- Contacts List -->
+                <ListBox Grid.Row="3" x:Name="ContactsList" Background="Transparent" Margin="6,0,6,0" SelectionChanged="OnContactSelectionChanged">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:DataType="models:ContactCard">
+                            <Border Background="#18202D" CornerRadius="8" Padding="10" Margin="0,3,0,3">
+                                <Grid ColumnDefinitions="Auto, *, Auto">
+                                    <Border Width="38" Height="38" CornerRadius="19" Background="#1E3A5F" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding DisplayName[0]}" FontSize="16" FontWeight="Bold" Foreground="#93C5FD" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+
+                                    <StackPanel Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13" Foreground="White"/>
+                                        <TextBlock Text="{Binding Username}" FontSize="11" Foreground="#60A5FA"/>
+                                        <TextBlock Text="{Binding LastMessagePreview}" FontSize="11" Foreground="#9CA3AF" TextTrimming="CharacterEllipsis" MaxWidth="160"/>
+                                    </StackPanel>
+
+                                    <TextBlock Grid.Column="2" Text="{Binding LastMessageTime}" FontSize="10" Foreground="#6B7280" VerticalAlignment="Top"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <!-- Bottom Action: Invite Link -->
+                <Border Grid.Row="4" Background="#18202D" Padding="10" Margin="10,6,10,10" CornerRadius="8">
+                    <Grid ColumnDefinitions="*, Auto">
+                        <TextBlock Text="Share My Invite Link" VerticalAlignment="Center" FontSize="12" Foreground="#9CA3AF"/>
+                        <Button Grid.Column="1" Content="Copy Link" Click="OnCopyInviteClicked" Background="#232C3A" Foreground="#60A5FA" FontSize="11" Padding="8,4"/>
+                    </Grid>
+                </Border>
+            </Grid>
         </Border>
 
-        <!-- Input Bar -->
-        <Grid Grid.Row="4" ColumnDefinitions="*, Auto" Margin="0,12,0,0">
-            <TextBox Grid.Column="0" x:Name="MessageInputBox" Watermark="Type message (protected with Double Ratchet + ECDSA Signature)..." Height="44" VerticalContentAlignment="Center" KeyDown="OnMessageInputKeyDown"/>
-            <Button Grid.Column="1" Content="Send Securely" Click="OnSendClicked" Background="#4A90E2" Foreground="White" FontWeight="Bold" Margin="10,0,0,0" Height="44" Padding="24,0"/>
+        <!-- RIGHT PANEL: ACTIVE CHAT -->
+        <Grid Grid.Column="1" RowDefinitions="Auto, *, Auto" Margin="16">
+            <!-- Active Chat Header -->
+            <Border Grid.Row="0" Background="#121721" CornerRadius="10" Padding="14" Margin="0,0,0,10">
+                <Grid ColumnDefinitions="Auto, *, Auto">
+                    <Border Width="40" Height="40" CornerRadius="20" Background="#2B5278" VerticalAlignment="Center">
+                        <TextBlock x:Name="ActivePeerInitial" Text="?" FontSize="16" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+
+                    <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <TextBlock x:Name="ActivePeerNameText" Text="Select a contact" FontWeight="Bold" FontSize="15" Foreground="White"/>
+                        <TextBlock x:Name="ActivePeerDetailsText" Text="End-to-End Encrypted via Signal Double Ratchet" FontSize="11" Foreground="#34D399"/>
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                        <TextBlock x:Name="EncryptionBadge" Text="🔒 E2EE" Foreground="#34D399" FontWeight="Bold" FontSize="12" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Message History -->
+            <Border Grid.Row="1" Background="#121721" CornerRadius="10" Padding="12">
+                <ListBox x:Name="MessagesList" Background="#0B0E14" CornerRadius="8" Padding="10">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:DataType="local:ChatMessage">
+                            <Border Background="{Binding BackgroundColor}" CornerRadius="8" Padding="12" Margin="4,4,4,4" MaxWidth="680" HorizontalAlignment="{Binding Alignment}">
+                                <StackPanel Spacing="4">
+                                    <Grid ColumnDefinitions="*, Auto">
+                                        <TextBlock Text="{Binding Header}" FontSize="11" Foreground="#93C5FD" FontWeight="Bold"/>
+                                        <TextBlock Grid.Column="1" Text="{Binding StatusBadge}" FontSize="9" Foreground="#34D399" Margin="8,0,0,0"/>
+                                    </Grid>
+                                    <TextBlock Text="{Binding Text}" FontSize="14" Foreground="White" TextWrapping="Wrap"/>
+                                    <TextBlock Text="{Binding Time}" FontSize="10" Foreground="#6B7280" HorizontalAlignment="Right"/>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Border>
+
+            <!-- Message Input Composer -->
+            <Grid Grid.Row="2" ColumnDefinitions="*, Auto" Margin="0,10,0,0">
+                <TextBox Grid.Column="0" x:Name="MessageInputBox" Watermark="Write an encrypted message (Double Ratchet + ECDSA Signed)..." Height="46" VerticalContentAlignment="Center" KeyDown="OnMessageInputKeyDown"/>
+                <Button Grid.Column="1" Content="Send" Click="OnSendClicked" Background="#2563EB" Foreground="White" FontWeight="Bold" Margin="10,0,0,0" Height="46" Padding="26,0"/>
+            </Grid>
         </Grid>
     </Grid>
 </Window>

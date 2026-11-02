@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 using Messa.Core.Crypto;
 
@@ -8,6 +9,7 @@ namespace Messa.Core.Models
         [JsonPropertyName("type")]
         public string Type { get; set; } = string.Empty;
 
+        // Identity & Search
         [JsonPropertyName("fingerprint")]
         public string? Fingerprint { get; set; }
 
@@ -17,6 +19,39 @@ namespace Messa.Core.Models
         [JsonPropertyName("query")]
         public string? Query { get; set; }
 
+        [JsonPropertyName("profile")]
+        public UserProfile? Profile { get; set; }
+
+        [JsonPropertyName("searchResults")]
+        public List<UserProfile>? SearchResults { get; set; }
+
+        // Challenge-Response Handshake
+        [JsonPropertyName("nonce")]
+        public string? Nonce { get; set; }
+
+        [JsonPropertyName("signingPublicKey")]
+        public string? SigningPublicKey { get; set; }
+
+        [JsonPropertyName("signature")]
+        public string? Signature { get; set; }
+
+        // 2FA SRP-6a
+        [JsonPropertyName("twoFactorSalt")]
+        public string? TwoFactorSalt { get; set; }
+
+        [JsonPropertyName("twoFactorB")]
+        public string? TwoFactorB { get; set; }
+
+        [JsonPropertyName("twoFactorA")]
+        public string? TwoFactorA { get; set; }
+
+        [JsonPropertyName("twoFactorProof")]
+        public string? TwoFactorProof { get; set; }
+
+        [JsonPropertyName("enable2FA")]
+        public bool? Enable2FA { get; set; }
+
+        // Pre-Key Bundle & Double Ratchet
         [JsonPropertyName("bundle")]
         public PreKeyBundle? Bundle { get; set; }
 
@@ -26,6 +61,7 @@ namespace Messa.Core.Models
         [JsonPropertyName("senderIdDhKey")]
         public string? SenderIdentityDhKeyBase64 { get; set; }
 
+        // General
         [JsonPropertyName("error")]
         public string? Error { get; set; }
 
