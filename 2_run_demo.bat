@@ -1,8 +1,4 @@
 @echo off
 chcp 65001 > nul
-title Тестирование E2EE доставки
-echo ===================================================
-echo [СУВЕРЕННЫЙ МЕССЕНДЖЕР] Запуск симуляции (Алиса и Боб)...
-echo ===================================================
-node test_scenario.js
-pause
+echo [MESSA] Starting Native Avalonia UI Client (Skia)...
+"%USERPROFILE%\.dotnet\dotnet.exe" run --project src\Messa.Desktop\Messa.Desktop.csproj
