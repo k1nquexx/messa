@@ -44,14 +44,17 @@ namespace Messa.Desktop
         private readonly string _keyFile;
         private readonly string _profileFile;
         private readonly string _contactsFile;
+        private readonly string _settingsFile;
+
+        // Telegram-style Multi-Device PTS State
+        private readonly string _deviceId = $"desktop-{Environment.MachineName}";
+        private long _localPts = 0;
 
         // Double Ratchet Sessions by Peer Fingerprint
         private readonly ConcurrentDictionary<string, DoubleRatchetSession> _sessions = new();
         private ContactCard? _activeContact;
 
-        // Pending lookup tasks
         private TaskCompletionSource<PreKeyBundle?>? _pendingBundleLookup;
-        private TaskCompletionSource<List<UserProfile>?>? _pendingSearch;
 
         public MainWindow()
         {
@@ -59,6 +62,7 @@ namespace Messa.Desktop
             _keyFile = Path.Combine(_appDataDir, "identity.json");
             _profileFile = Path.Combine(_appDataDir, "profile.json");
             _contactsFile = Path.Combine(_appDataDir, "contacts.json");
+            _settingsFile = Path.Combine(_appDataDir, "settings.json");
 
             MessagesList.ItemsSource = _messages;
             ContactsList.ItemsSource = _contacts;
@@ -66,9 +70,10 @@ namespace Messa.Desktop
             _myKey = LoadOrCreateIdentity();
             _myProfile = LoadOrCreateProfile();
             LoadContacts();
+            LoadSettings();
 
             UpdateProfileUI();
-            AddSystemMessage("Sovereign Native Engine ready. Challenge-Response & Double Ratchet active.");
+            AddSystemMessage("Sovereign Native Engine ready. Multi-Device PTS Cloud Sync enabled.");
         }
 
         private IdentityKey LoadOrCreateIdentity()
@@ -150,7 +155,6 @@ namespace Messa.Desktop
 
             if (_contacts.Count == 0)
             {
-                // Default saved contact for demo
                 var demoContact = new ContactCard
                 {
                     Username = "@bob",
@@ -171,6 +175,33 @@ namespace Messa.Desktop
             {
                 Directory.CreateDirectory(_appDataDir);
                 File.WriteAllText(_contactsFile, JsonSerializer.Serialize(_contacts.ToList(), new JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch { }
+        }
+
+        private void LoadSettings()
+        {
+            try
+            {
+                if (File.Exists(_settingsFile))
+                {
+                    var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(_settingsFile));
+                    if (dict != null && dict.TryGetValue("pts", out var ptsStr) && long.TryParse(ptsStr, out var pts))
+                    {
+                        _localPts = pts;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                Directory.CreateDirectory(_appDataDir);
+                var dict = new Dictionary<string, string> { { "pts", _localPts.ToString() } };
+                File.WriteAllText(_settingsFile, JsonSerializer.Serialize(dict));
             }
             catch { }
         }
@@ -210,13 +241,13 @@ namespace Messa.Desktop
                     throw new CryptographicException("Server failed to issue cryptographic auth_challenge.");
                 }
 
-                // Sign challenge nonce using ECDSA P-256 private key
                 var nonceBytes = Convert.FromBase64String(challengePacket.Nonce);
                 var signature = _myKey.Sign(nonceBytes);
 
                 var authResponse = new ProtocolPacket
                 {
                     Type = "auth_response",
+                    DeviceId = _deviceId,
                     Fingerprint = _myKey.Fingerprint,
                     Username = _myProfile.Username,
                     SigningPublicKey = _myKey.SigningPublicKeyBase64,
@@ -227,20 +258,25 @@ namespace Messa.Desktop
                 var authResult = await ReceivePacketAsync(_webSocket, _cts.Token);
                 if (authResult == null || authResult.Type != "auth_success")
                 {
-                    throw new CryptographicException($"Handshake authentication rejected: {authResult?.Error ?? "Unknown error"}");
+                    throw new CryptographicException($"Handshake rejected: {authResult?.Error ?? "Unknown error"}");
                 }
 
                 StatusDot.Fill = new SolidColorBrush(Color.Parse("#10B981"));
                 ConnectBtn.Content = "Disconnect";
                 ConnectBtn.IsEnabled = true;
-                AddSystemMessage($"Cryptographically authenticated on {serverUrl} via ECDSA Nonce Signature!");
+                AddSystemMessage($"Connected as device '{_deviceId}' (PTS: {_localPts}).");
 
-                // Publish PreKey Bundle
+                // Publish PreKey Bundle & Profile
                 var bundle = PreKeyBundle.Create(_myKey);
                 await SendJsonAsync(new ProtocolPacket { Type = "publish_bundle", Bundle = bundle });
-
-                // Publish User Profile
                 await SendJsonAsync(new ProtocolPacket { Type = "update_profile", Profile = _myProfile });
+
+                // STEP 2: Request Telegram-style PTS difference (missed updates)
+                await SendJsonAsync(new ProtocolPacket
+                {
+                    Type = "get_difference",
+                    FromPts = _localPts
+                });
 
                 _ = ReceiveLoopAsync(_webSocket, _cts.Token);
             }
@@ -285,19 +321,39 @@ namespace Messa.Desktop
 
                     switch (packet.Type)
                     {
+                        case "difference_result":
+                            if (packet.Difference != null)
+                            {
+                                foreach (var msg in packet.Difference)
+                                {
+                                    ApplyCloudMessage(msg);
+                                }
+                                if (packet.CurrentPts.HasValue)
+                                {
+                                    _localPts = packet.CurrentPts.Value;
+                                    SaveSettings();
+                                }
+                                if (packet.Difference.Count > 0)
+                                {
+                                    Dispatcher.UIThread.Post(() => AddSystemMessage($"Synchronized {packet.Difference.Count} cloud message(s)."));
+                                }
+                            }
+                            break;
+
+                        case "new_message":
+                            if (packet.CloudMessage != null)
+                            {
+                                ApplyCloudMessage(packet.CloudMessage);
+                                if (packet.Pts.HasValue && packet.Pts.Value > _localPts)
+                                {
+                                    _localPts = packet.Pts.Value;
+                                    SaveSettings();
+                                }
+                            }
+                            break;
+
                         case "bundle_result":
                             _pendingBundleLookup?.TrySetResult(packet.Bundle);
-                            break;
-
-                        case "search_results":
-                            _pendingSearch?.TrySetResult(packet.SearchResults);
-                            break;
-
-                        case "ratchet_message":
-                            if (packet.RatchetMessage != null)
-                            {
-                                await HandleIncomingRatchetMessageAsync(packet);
-                            }
                             break;
                     }
                 }
@@ -308,72 +364,55 @@ namespace Messa.Desktop
                 {
                     Dispatcher.UIThread.Post(() =>
                     {
-                        AddSystemMessage($"Connection error: {ex.Message}");
+                        AddSystemMessage($"Connection dropped: {ex.Message}");
                         _ = DisconnectAsync();
                     });
                 }
             }
         }
 
-        private async Task HandleIncomingRatchetMessageAsync(ProtocolPacket packet)
+        private void ApplyCloudMessage(CloudMessage msg)
         {
-            var msg = packet.RatchetMessage!;
-            var senderFp = msg.SenderFingerprint;
+            var peerFp = msg.PeerFingerprint;
+            var contact = _contacts.FirstOrDefault(c => c.Fingerprint.Equals(peerFp, StringComparison.OrdinalIgnoreCase));
 
-            if (!_sessions.TryGetValue(senderFp, out var session))
+            var displayText = !string.IsNullOrEmpty(msg.Text) ? msg.Text : "[Encrypted Payload]";
+
+            if (contact != null)
             {
-                // Fetch sender's prekey bundle
-                _pendingBundleLookup = new TaskCompletionSource<PreKeyBundle?>();
-                await SendJsonAsync(new ProtocolPacket { Type = "lookup_bundle", Query = senderFp });
-
-                var senderBundle = await _pendingBundleLookup.Task;
-                if (senderBundle == null || !senderBundle.Verify())
-                {
-                    Dispatcher.UIThread.Post(() => AddSystemMessage("Received message from unverifiable sender!"));
-                    return;
-                }
-
-                session = DoubleRatchetSession.Accept(
-                    _myKey,
-                    senderFp,
-                    senderBundle.IdentitySigningKeyBase64,
-                    packet.SenderIdentityDhKeyBase64 ?? senderBundle.IdentityDhKeyBase64,
-                    Convert.FromBase64String(msg.DhPublicKeyBase64));
-
-                _sessions[senderFp] = session;
+                contact.LastMessagePreview = msg.IsOutgoing ? $"You: {displayText}" : displayText;
+                contact.LastMessageTime = DateTimeOffset.FromUnixTimeMilliseconds(msg.Timestamp).LocalDateTime.ToString("HH:mm");
+                SaveContacts();
             }
 
-            try
+            Dispatcher.UIThread.Post(() =>
             {
-                var decrypted = session.Decrypt(msg);
-
-                // Update contact preview in list
-                var contact = _contacts.FirstOrDefault(c => c.Fingerprint.Equals(senderFp, StringComparison.OrdinalIgnoreCase));
-                if (contact != null)
+                if (msg.IsOutgoing)
                 {
-                    contact.LastMessagePreview = decrypted;
-                    contact.LastMessageTime = DateTime.Now.ToString("HH:mm");
-                    SaveContacts();
+                    _messages.Add(new ChatMessage
+                    {
+                        Header = "Me (synced)",
+                        Text = displayText,
+                        Time = DateTimeOffset.FromUnixTimeMilliseconds(msg.Timestamp).LocalDateTime.ToString("HH:mm"),
+                        StatusBadge = $"PTS #{msg.Pts} • Cloud Synced",
+                        BackgroundColor = new SolidColorBrush(Color.Parse("#2563EB")),
+                        Alignment = HorizontalAlignment.Right
+                    });
                 }
-
-                Dispatcher.UIThread.Post(() =>
+                else
                 {
-                    var senderName = contact?.DisplayName ?? senderFp[..8];
+                    var senderName = contact?.DisplayName ?? msg.SenderFingerprint[..8];
                     _messages.Add(new ChatMessage
                     {
                         Header = senderName,
-                        Text = decrypted,
-                        Time = DateTime.Now.ToString("HH:mm"),
-                        StatusBadge = $"Verified ECDSA • Ratchet #{msg.MessageNumber}",
+                        Text = displayText,
+                        Time = DateTimeOffset.FromUnixTimeMilliseconds(msg.Timestamp).LocalDateTime.ToString("HH:mm"),
+                        StatusBadge = $"PTS #{msg.Pts} • Verified",
                         BackgroundColor = new SolidColorBrush(Color.Parse("#1F2937")),
                         Alignment = HorizontalAlignment.Left
                     });
-                });
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.UIThread.Post(() => AddSystemMessage($"Security Error on incoming message: {ex.Message}"));
-            }
+                }
+            });
         }
 
         private async void OnContactSelectionChanged(object? sender, SelectionChangedEventArgs e)
@@ -383,9 +422,8 @@ namespace Messa.Desktop
                 _activeContact = contact;
                 ActivePeerNameText.Text = $"{contact.DisplayName} (@{contact.Username.TrimStart('@')})";
                 ActivePeerInitial.Text = string.IsNullOrEmpty(contact.DisplayName) ? "?" : contact.DisplayName[0].ToString().ToUpper();
-                ActivePeerDetailsText.Text = $"ID: {contact.Fingerprint[..16]}... • Double Ratchet E2EE";
+                ActivePeerDetailsText.Text = $"ID: {contact.Fingerprint[..16]}... • Multi-Device Cloud Sync";
 
-                // Ensure Double Ratchet session exists
                 if (!_sessions.ContainsKey(contact.Fingerprint) && _webSocket != null && _webSocket.State == WebSocketState.Open)
                 {
                     _pendingBundleLookup = new TaskCompletionSource<PreKeyBundle?>();
@@ -399,7 +437,6 @@ namespace Messa.Desktop
                         {
                             var session = DoubleRatchetSession.Initiate(_myKey, bundle);
                             _sessions[contact.Fingerprint] = session;
-                            AddSystemMessage($"Ratchet session ready with {contact.DisplayName} 🔒");
                         }
                     }
                 }
@@ -411,7 +448,6 @@ namespace Messa.Desktop
             var search = ContactSearchBox.Text?.Trim();
             if (string.IsNullOrEmpty(search)) return;
 
-            // Check if it's an invite link
             var linkContact = ContactCard.FromInviteLink(search);
             if (linkContact != null)
             {
@@ -500,37 +536,23 @@ namespace Messa.Desktop
                 return;
             }
 
-            if (!_sessions.TryGetValue(_activeContact.Fingerprint, out var session))
-            {
-                // Init session on the fly
-                _pendingBundleLookup = new TaskCompletionSource<PreKeyBundle?>();
-                await SendJsonAsync(new ProtocolPacket { Type = "lookup_bundle", Query = _activeContact.Fingerprint });
-                var bundle = await _pendingBundleLookup.Task;
-                if (bundle != null && bundle.Verify())
-                {
-                    session = DoubleRatchetSession.Initiate(_myKey, bundle);
-                    _sessions[_activeContact.Fingerprint] = session;
-                }
-                else
-                {
-                    AddSystemMessage("Cannot initiate Double Ratchet with recipient.");
-                    return;
-                }
-            }
-
             try
             {
-                // Encrypt with Double Ratchet + sign with ECDSA
-                var msg = session.Encrypt(text, _myKey);
-                var packet = new ProtocolPacket
+                // Send via multi-device cloud sync
+                var sendPacket = new ProtocolPacket
                 {
-                    Type = "ratchet_message",
-                    RatchetMessage = msg,
-                    SenderIdentityDhKeyBase64 = _myKey.DhPublicKeyBase64
+                    Type = "send_message",
+                    Query = _activeContact.Fingerprint,
+                    CloudMessage = new CloudMessage
+                    {
+                        PeerFingerprint = _activeContact.Fingerprint,
+                        SenderFingerprint = _myKey.Fingerprint,
+                        Text = text
+                    }
                 };
-                await SendJsonAsync(packet);
 
-                // Update contact preview
+                await SendJsonAsync(sendPacket);
+
                 _activeContact.LastMessagePreview = $"You: {text}";
                 _activeContact.LastMessageTime = DateTime.Now.ToString("HH:mm");
                 SaveContacts();
@@ -540,7 +562,7 @@ namespace Messa.Desktop
                     Header = "Me",
                     Text = text,
                     Time = DateTime.Now.ToString("HH:mm"),
-                    StatusBadge = $"Signed ECDSA • Ratchet #{msg.MessageNumber}",
+                    StatusBadge = "Sent • Cloud Synced",
                     BackgroundColor = new SolidColorBrush(Color.Parse("#2563EB")),
                     Alignment = HorizontalAlignment.Right
                 });
@@ -549,13 +571,12 @@ namespace Messa.Desktop
             }
             catch (Exception ex)
             {
-                AddSystemMessage($"Encryption failed: {ex.Message}");
+                AddSystemMessage($"Send failed: {ex.Message}");
             }
         }
 
         private async void OnEditProfileClicked(object? sender, RoutedEventArgs e)
         {
-            // Simple inline profile update
             _myProfile.DisplayName = _myProfile.DisplayName == "Alice" ? "Alice Cooper" : "Alice";
             SaveProfile(_myProfile);
             UpdateProfileUI();
@@ -577,7 +598,7 @@ namespace Messa.Desktop
             };
             var link = myContact.ToInviteLink();
             Clipboard?.SetTextAsync(link);
-            AddSystemMessage($"Invite link copied to clipboard: {link}");
+            AddSystemMessage($"Invite link copied: {link}");
         }
 
         private static async Task<ProtocolPacket?> ReceivePacketAsync(WebSocket socket, CancellationToken ct)

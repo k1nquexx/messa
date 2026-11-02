@@ -9,6 +9,10 @@ namespace Messa.Core.Models
         [JsonPropertyName("type")]
         public string Type { get; set; } = string.Empty;
 
+        // Device & Multi-Device Session
+        [JsonPropertyName("deviceId")]
+        public string? DeviceId { get; set; }
+
         // Identity & Search
         [JsonPropertyName("fingerprint")]
         public string? Fingerprint { get; set; }
@@ -50,6 +54,22 @@ namespace Messa.Core.Models
 
         [JsonPropertyName("enable2FA")]
         public bool? Enable2FA { get; set; }
+
+        // Telegram-style Multi-Device PTS Sync (Variant A)
+        [JsonPropertyName("pts")]
+        public long? Pts { get; set; }
+
+        [JsonPropertyName("fromPts")]
+        public long? FromPts { get; set; }
+
+        [JsonPropertyName("currentPts")]
+        public long? CurrentPts { get; set; }
+
+        [JsonPropertyName("cloudMessage")]
+        public CloudMessage? CloudMessage { get; set; }
+
+        [JsonPropertyName("difference")]
+        public List<CloudMessage>? Difference { get; set; }
 
         // Pre-Key Bundle & Double Ratchet
         [JsonPropertyName("bundle")]

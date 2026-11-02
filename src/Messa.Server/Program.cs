@@ -14,15 +14,18 @@ using System.Threading;
 using System.Threading.Tasks;
 using Messa.Core.Models;
 using Messa.Core.Crypto;
+using Messa.Core.Storage;
 
 namespace Messa.Server
 {
     class Program
     {
         private static readonly int Port = 8080;
-        private static readonly ConcurrentDictionary<string, WebSocket> ConnectedClients = new();
+
+        // Multi-Device Socket Tracking: AccountFingerprint -> (DeviceId -> WebSocket)
+        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> ConnectedDevicesByAccount = new();
+
         private static readonly string DataDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data");
-        private static readonly string DeadDropFile = Path.Combine(DataDir, "deaddrop.json");
         private static readonly string KeyDirFile = Path.Combine(DataDir, "key_directory.json");
         private static readonly string ProfilesFile = Path.Combine(DataDir, "profiles.json");
         private static readonly string TunnelFile = Path.Combine(DataDir, "tunnel.json");
@@ -34,21 +37,21 @@ namespace Messa.Server
         // Profiles
         private static readonly ConcurrentDictionary<string, UserProfile> ProfilesByFingerprint = new();
 
-        // Offline Dead-Drop queue
-        private static readonly ConcurrentDictionary<string, List<ProtocolPacket>> OfflineQueue = new();
+        // Telegram-style Multi-Device PTS Message Store
+        private static PtsMessageStore _ptsStore = null!;
         private static Process? _cloudflaredProcess;
 
         static async Task Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
-            Console.Title = "MESSA - Sovereign Relay Server (C# / .NET 8)";
+            Console.Title = "MESSA - Multi-Device Sovereign Cloud Relay (.NET 8)";
 
             PrintBanner();
 
             Directory.CreateDirectory(DataDir);
+            _ptsStore = new PtsMessageStore(DataDir);
             LoadProfiles();
             LoadKeyDirectory();
-            LoadOfflineQueue();
 
             StartCloudflareTunnel();
 
@@ -71,7 +74,7 @@ namespace Messa.Server
 
             AppDomain.CurrentDomain.ProcessExit += (s, e) => StopCloudflareTunnel();
 
-            LogInfo("Relay is active with Challenge-Response Handshake and SRP-6a 2FA protection.");
+            LogInfo("Relay is active: Multi-Device Sync (PTS sequence) and Challenge-Response Handshake enabled.");
 
             while (true)
             {
@@ -84,7 +87,7 @@ namespace Messa.Server
                     }
                     else
                     {
-                        var resp = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"service\":\"MESSA Sovereign Relay Server\"}");
+                        var resp = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"service\":\"MESSA Multi-Device Sovereign Cloud Relay\"}");
                         context.Response.ContentType = "application/json";
                         context.Response.ContentLength64 = resp.Length;
                         await context.Response.OutputStream.WriteAsync(resp);
@@ -115,24 +118,21 @@ namespace Messa.Server
 
             var webSocket = wsCtx.WebSocket;
             string? authenticatedFingerprint = null;
+            string? deviceId = null;
 
             try
             {
                 // STEP 1: Mandatory Challenge-Response Handshake
-                // Generate cryptographically random 32-byte nonce
                 var nonceBytes = new byte[32];
                 RandomNumberGenerator.Fill(nonceBytes);
                 var nonceBase64 = Convert.ToBase64String(nonceBytes);
 
-                // Send challenge to client
-                var challengePacket = new ProtocolPacket
+                await SendJsonAsync(webSocket, new ProtocolPacket
                 {
                     Type = "auth_challenge",
                     Nonce = nonceBase64
-                };
-                await SendJsonAsync(webSocket, challengePacket);
+                });
 
-                // Await client auth_response with 10-second timeout
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
                 var authPacket = await ReceivePacketAsync(webSocket, cts.Token);
 
@@ -153,7 +153,7 @@ namespace Messa.Server
 
                 if (!string.Equals(expectedFp, authPacket.Fingerprint, StringComparison.OrdinalIgnoreCase))
                 {
-                    LogWarn($"Handshake rejected: Fingerprint does not match public key! Claimed: {authPacket.Fingerprint}");
+                    LogWarn($"Handshake rejected: Fingerprint mismatch! Claimed: {authPacket.Fingerprint}");
                     await webSocket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Fingerprint mismatch", CancellationToken.None);
                     return;
                 }
@@ -164,17 +164,16 @@ namespace Messa.Server
 
                 if (!isSigValid)
                 {
-                    LogWarn($"Handshake rejected: Invalid digital signature for {authPacket.Fingerprint[..8]}... Spoofing attempt blocked!");
+                    LogWarn($"Handshake rejected: Invalid digital signature for {authPacket.Fingerprint[..8]}!");
                     await webSocket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Invalid signature", CancellationToken.None);
                     return;
                 }
 
-                // Verify 3: SRP-6a 2FA Cloud Password (if enabled on account)
+                // Verify 3: SRP-6a 2FA Cloud Password (if enabled)
                 if (ProfilesByFingerprint.TryGetValue(authPacket.Fingerprint, out var userProfile) && userProfile.Has2FA)
                 {
                     if (string.IsNullOrEmpty(authPacket.TwoFactorProof) || string.IsNullOrEmpty(authPacket.TwoFactorA))
                     {
-                        // Challenge client for 2FA SRP-6a
                         var (serverB, secretB) = Srp6aAuth.GenerateServerChallenge(userProfile.TwoFactorVerifierBase64!);
                         await SendJsonAsync(webSocket, new ProtocolPacket
                         {
@@ -199,12 +198,16 @@ namespace Messa.Server
                     }
                 }
 
-                // Authentication succeeded! Bind socket
+                // STEP 2: Authenticated! Register this Device for this Account
                 authenticatedFingerprint = authPacket.Fingerprint;
-                ConnectedClients[authenticatedFingerprint] = webSocket;
-                LogSuccess($"[AUTH OK] Cryptographically authenticated client: {authenticatedFingerprint[..8]}...");
+                deviceId = string.IsNullOrEmpty(authPacket.DeviceId) ? $"dev-{Guid.NewGuid():N}"[..12] : authPacket.DeviceId;
 
-                // Ensure profile exists
+                var devices = ConnectedDevicesByAccount.GetOrAdd(authenticatedFingerprint, _ => new ConcurrentDictionary<string, WebSocket>());
+                devices[deviceId] = webSocket;
+
+                var totalDevices = devices.Count;
+                LogSuccess($"[AUTH OK] Account: {authenticatedFingerprint[..8]}... Device: {deviceId} connected (Total online devices for account: {totalDevices})");
+
                 if (!ProfilesByFingerprint.TryGetValue(authenticatedFingerprint, out userProfile))
                 {
                     userProfile = new UserProfile
@@ -221,17 +224,18 @@ namespace Messa.Server
                     SaveProfiles();
                 }
 
-                // Send auth_success
+                var currentPts = _ptsStore.GetCurrentPts(authenticatedFingerprint);
+
+                // Send auth_success with current PTS
                 await SendJsonAsync(webSocket, new ProtocolPacket
                 {
                     Type = "auth_success",
-                    Profile = userProfile
+                    DeviceId = deviceId,
+                    Profile = userProfile,
+                    CurrentPts = currentPts
                 });
 
-                // Flush dead-drop messages
-                await DeliverOfflineMessagesAsync(authenticatedFingerprint, webSocket);
-
-                // STEP 2: Main Message Loop
+                // STEP 3: Message Loop
                 while (webSocket.State == WebSocketState.Open)
                 {
                     var packet = await ReceivePacketAsync(webSocket, CancellationToken.None);
@@ -239,6 +243,87 @@ namespace Messa.Server
 
                     switch (packet.Type)
                     {
+                        case "get_difference":
+                            var fromPts = packet.FromPts ?? 0;
+                            var (diffMessages, latestPts) = _ptsStore.GetDifference(authenticatedFingerprint, fromPts);
+                            await SendJsonAsync(webSocket, new ProtocolPacket
+                            {
+                                Type = "difference_result",
+                                Difference = diffMessages,
+                                CurrentPts = latestPts
+                            });
+                            LogInfo($"[PTS SYNC] Sent {diffMessages.Count} updates (pts > {fromPts}) to device {deviceId}");
+                            break;
+
+                        case "send_message":
+                            if (!string.IsNullOrEmpty(packet.Query) || packet.CloudMessage != null)
+                            {
+                                var recipientFp = packet.Query ?? packet.CloudMessage?.PeerFingerprint ?? "";
+                                var ciphertext = packet.CloudMessage?.CiphertextBase64 ?? "";
+                                var tag = packet.CloudMessage?.TagBase64 ?? "";
+                                var iv = packet.CloudMessage?.IvBase64 ?? "";
+                                var sig = packet.CloudMessage?.SignatureBase64 ?? "";
+                                var plainText = packet.CloudMessage?.Text ?? "";
+
+                                if (!string.IsNullOrEmpty(recipientFp))
+                                {
+                                    // Store and sequence for both recipient and sender accounts
+                                    var (recipientRecord, senderRecord) = _ptsStore.StoreAndSequenceMessage(
+                                        authenticatedFingerprint,
+                                        recipientFp,
+                                        ciphertext,
+                                        tag,
+                                        iv,
+                                        sig,
+                                        plainText);
+
+                                    // 1. Fan-out to ALL active devices of Recipient
+                                    if (ConnectedDevicesByAccount.TryGetValue(recipientFp, out var recipientDeviceDict))
+                                    {
+                                        foreach (var kvp in recipientDeviceDict)
+                                        {
+                                            if (kvp.Value.State == WebSocketState.Open)
+                                            {
+                                                _ = SendJsonAsync(kvp.Value, new ProtocolPacket
+                                                {
+                                                    Type = "new_message",
+                                                    CloudMessage = recipientRecord,
+                                                    Pts = recipientRecord.Pts
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    // 2. Multi-device sync: Fan-out echo to ALL OTHER devices of Sender (e.g. PC if sent from Phone)
+                                    if (ConnectedDevicesByAccount.TryGetValue(authenticatedFingerprint, out var senderDeviceDict))
+                                    {
+                                        foreach (var kvp in senderDeviceDict)
+                                        {
+                                            if (kvp.Key != deviceId && kvp.Value.State == WebSocketState.Open)
+                                            {
+                                                _ = SendJsonAsync(kvp.Value, new ProtocolPacket
+                                                {
+                                                    Type = "new_message",
+                                                    CloudMessage = senderRecord,
+                                                    Pts = senderRecord.Pts
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    // Acknowledge sending socket
+                                    await SendJsonAsync(webSocket, new ProtocolPacket
+                                    {
+                                        Type = "status",
+                                        Status = "delivered",
+                                        Pts = senderRecord.Pts
+                                    });
+
+                                    LogInfo($"[MSG ROUTED] From {authenticatedFingerprint[..8]} to {recipientFp[..8]} (Sender Pts: {senderRecord.Pts}, Recipient Pts: {recipientRecord.Pts})");
+                                }
+                            }
+                            break;
+
                         case "publish_bundle":
                             if (packet.Bundle != null && packet.Bundle.Verify())
                             {
@@ -323,23 +408,6 @@ namespace Messa.Server
                             }
                             break;
 
-                        case "ratchet_message":
-                            if (packet.RatchetMessage != null)
-                            {
-                                var recipient = packet.RatchetMessage.RecipientFingerprint;
-                                if (ConnectedClients.TryGetValue(recipient, out var recipientSocket) && recipientSocket.State == WebSocketState.Open)
-                                {
-                                    await SendJsonAsync(recipientSocket, packet);
-                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "status", Status = "delivered" });
-                                }
-                                else
-                                {
-                                    EnqueueOfflineMessage(recipient, packet);
-                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "status", Status = "queued_offline" });
-                                }
-                            }
-                            break;
-
                         case "ping":
                             await SendJsonAsync(webSocket, new ProtocolPacket { Type = "pong" });
                             break;
@@ -352,10 +420,17 @@ namespace Messa.Server
             }
             finally
             {
-                if (!string.IsNullOrEmpty(authenticatedFingerprint))
+                if (!string.IsNullOrEmpty(authenticatedFingerprint) && !string.IsNullOrEmpty(deviceId))
                 {
-                    ConnectedClients.TryRemove(authenticatedFingerprint, out _);
-                    LogInfo($"Client disconnected: {authenticatedFingerprint[..8]}...");
+                    if (ConnectedDevicesByAccount.TryGetValue(authenticatedFingerprint, out var devDict))
+                    {
+                        devDict.TryRemove(deviceId, out _);
+                        if (devDict.IsEmpty)
+                        {
+                            ConnectedDevicesByAccount.TryRemove(authenticatedFingerprint, out _);
+                        }
+                    }
+                    LogInfo($"Device {deviceId} disconnected for account {authenticatedFingerprint[..8]}...");
                 }
                 webSocket.Dispose();
             }
@@ -369,11 +444,7 @@ namespace Messa.Server
             do
             {
                 res = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
-                if (res.MessageType == WebSocketMessageType.Close)
-                {
-                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", ct);
-                    return null;
-                }
+                if (res.MessageType == WebSocketMessageType.Close) return null;
                 ms.Write(buffer, 0, res.Count);
             } while (!res.EndOfMessage);
 
@@ -386,29 +457,6 @@ namespace Messa.Server
             if (socket.State != WebSocketState.Open) return;
             var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
             await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-        }
-
-        private static void EnqueueOfflineMessage(string recipient, ProtocolPacket packet)
-        {
-            OfflineQueue.AddOrUpdate(recipient,
-                _ => new List<ProtocolPacket> { packet },
-                (_, list) => { lock (list) { list.Add(packet); } return list; });
-            SaveOfflineQueue();
-        }
-
-        private static async Task DeliverOfflineMessagesAsync(string recipient, WebSocket socket)
-        {
-            if (OfflineQueue.TryRemove(recipient, out var list))
-            {
-                List<ProtocolPacket> copy;
-                lock (list) copy = new List<ProtocolPacket>(list);
-
-                foreach (var p in copy)
-                {
-                    await SendJsonAsync(socket, p);
-                }
-                SaveOfflineQueue();
-            }
         }
 
         private static void LoadProfiles()
@@ -478,30 +526,6 @@ namespace Messa.Server
             catch { }
         }
 
-        private static void LoadOfflineQueue()
-        {
-            if (File.Exists(DeadDropFile))
-            {
-                try
-                {
-                    var data = JsonSerializer.Deserialize<Dictionary<string, List<ProtocolPacket>>>(File.ReadAllText(DeadDropFile));
-                    if (data != null)
-                        foreach (var kvp in data) OfflineQueue[kvp.Key] = kvp.Value;
-                }
-                catch { }
-            }
-        }
-
-        private static void SaveOfflineQueue()
-        {
-            try
-            {
-                var dict = new Dictionary<string, List<ProtocolPacket>>(OfflineQueue);
-                File.WriteAllText(DeadDropFile, JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true }));
-            }
-            catch { }
-        }
-
         private static void StartCloudflareTunnel()
         {
             try
@@ -538,7 +562,7 @@ namespace Messa.Server
             try { _cloudflaredProcess?.Kill(true); } catch { }
         }
 
-        private static void PrintBanner() => Console.WriteLine("\n[MESSA] Sovereign Native C# Relay Server (Challenge-Response + SRP-6a 2FA)\n");
+        private static void PrintBanner() => Console.WriteLine("\n[MESSA] Sovereign Multi-Device Cloud Relay (Telegram PTS Architecture)\n");
         private static void LogInfo(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [INFO] {m}");
         private static void LogSuccess(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [OK] {m}");
         private static void LogWarn(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [WARN] {m}");
