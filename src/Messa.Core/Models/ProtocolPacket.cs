@@ -55,7 +55,7 @@ namespace Messa.Core.Models
         [JsonPropertyName("enable2FA")]
         public bool? Enable2FA { get; set; }
 
-        // Telegram-style Multi-Device PTS Sync (Variant A)
+        // Telegram-style Multi-Device PTS Sync
         [JsonPropertyName("pts")]
         public long? Pts { get; set; }
 
@@ -70,6 +70,16 @@ namespace Messa.Core.Models
 
         [JsonPropertyName("difference")]
         public List<CloudMessage>? Difference { get; set; }
+
+        // Delivery & Read Receipts Tracking
+        [JsonPropertyName("messageId")]
+        public string? MessageId { get; set; }
+
+        [JsonPropertyName("chatId")]
+        public string? ChatId { get; set; }
+
+        [JsonPropertyName("deliveryStatus")]
+        public MessageDeliveryStatus? DeliveryStatus { get; set; }
 
         // Pre-Key Bundle & Double Ratchet
         [JsonPropertyName("bundle")]

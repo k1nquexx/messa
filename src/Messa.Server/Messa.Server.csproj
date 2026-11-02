@@ -12,4 +12,9 @@
     <ProjectReference Include="..\Messa.Core\Messa.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="StackExchange.Redis" Version="3.4.31" />
+  </ItemGroup>
+
 </Project>

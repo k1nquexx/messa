@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Messa.Core\Messa.Core.csproj" />
+    <ProjectReference Include="..\..\src\Messa.Server\Messa.Server.csproj" />
   </ItemGroup>
 
 </Project>

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Data.Sqlite;
+using Messa.Core.Models;
 
 namespace Messa.Core.Storage
 {
@@ -16,6 +17,7 @@ namespace Messa.Core.Storage
         public long Timestamp { get; set; }
         public string PlainText { get; set; } = string.Empty;
         public string Signature { get; set; } = string.Empty;
+        public MessageDeliveryStatus Status { get; set; } = MessageDeliveryStatus.Sent;
     }
 
     public class EncryptedLocalDatabase : IDisposable
@@ -73,7 +75,8 @@ namespace Messa.Core.Storage
                         pts INTEGER NOT NULL,
                         timestamp INTEGER NOT NULL,
                         plain_text TEXT NOT NULL,
-                        signature TEXT
+                        signature TEXT,
+                        status INTEGER DEFAULT 1
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp);
@@ -89,6 +92,15 @@ namespace Messa.Core.Storage
                     );
                 ";
                 cmd.ExecuteNonQuery();
+
+                // Safe migration in case table was created previously without status
+                try
+                {
+                    using var alterCmd = _connection.CreateCommand();
+                    alterCmd.CommandText = "ALTER TABLE messages ADD COLUMN status INTEGER DEFAULT 1;";
+                    alterCmd.ExecuteNonQuery();
+                }
+                catch { }
             }
         }
 
@@ -104,8 +116,8 @@ namespace Messa.Core.Storage
                     {
                         cmd.Transaction = trans;
                         cmd.CommandText = @"
-                            INSERT OR REPLACE INTO messages (id, chat_id, sender_id, is_outgoing, pts, timestamp, plain_text, signature)
-                            VALUES (@id, @chat_id, @sender_id, @is_outgoing, @pts, @timestamp, @plain_text, @signature);
+                            INSERT OR REPLACE INTO messages (id, chat_id, sender_id, is_outgoing, pts, timestamp, plain_text, signature, status)
+                            VALUES (@id, @chat_id, @sender_id, @is_outgoing, @pts, @timestamp, @plain_text, @signature, @status);
                         ";
                         cmd.Parameters.AddWithValue("@id", record.Id);
                         cmd.Parameters.AddWithValue("@chat_id", record.ChatId);
@@ -115,6 +127,7 @@ namespace Messa.Core.Storage
                         cmd.Parameters.AddWithValue("@timestamp", record.Timestamp);
                         cmd.Parameters.AddWithValue("@plain_text", record.PlainText);
                         cmd.Parameters.AddWithValue("@signature", record.Signature ?? "");
+                        cmd.Parameters.AddWithValue("@status", (int)record.Status);
                         cmd.ExecuteNonQuery();
                     }
 
@@ -143,6 +156,22 @@ namespace Messa.Core.Storage
             }
         }
 
+        public void UpdateMessageStatus(string messageId, MessageDeliveryStatus status)
+        {
+            lock (_dbLock)
+            {
+                using var cmd = _connection.CreateCommand();
+                cmd.CommandText = @"
+                    UPDATE messages
+                    SET status = @status
+                    WHERE id = @id;
+                ";
+                cmd.Parameters.AddWithValue("@id", messageId);
+                cmd.Parameters.AddWithValue("@status", (int)status);
+                cmd.ExecuteNonQuery();
+            }
+        }
+
         public List<LocalMessageRecord> GetMessagesForChat(string chatId, int limit = 100)
         {
             var results = new List<LocalMessageRecord>();
@@ -150,7 +179,7 @@ namespace Messa.Core.Storage
             {
                 using var cmd = _connection.CreateCommand();
                 cmd.CommandText = @"
-                    SELECT id, chat_id, sender_id, is_outgoing, pts, timestamp, plain_text, signature
+                    SELECT id, chat_id, sender_id, is_outgoing, pts, timestamp, plain_text, signature, status
                     FROM messages
                     WHERE chat_id = @chat_id
                     ORDER BY timestamp ASC
@@ -171,7 +200,8 @@ namespace Messa.Core.Storage
                         Pts = reader.GetInt64(4),
                         Timestamp = reader.GetInt64(5),
                         PlainText = reader.GetString(6),
-                        Signature = reader.IsDBNull(7) ? "" : reader.GetString(7)
+                        Signature = reader.IsDBNull(7) ? "" : reader.GetString(7),
+                        Status = (MessageDeliveryStatus)reader.GetInt32(8)
                     });
                 }
             }
@@ -191,7 +221,7 @@ namespace Messa.Core.Storage
                 using var cmd = _connection.CreateCommand();
 
                 var sql = @"
-                    SELECT m.id, m.chat_id, m.sender_id, m.is_outgoing, m.pts, m.timestamp, m.plain_text, m.signature
+                    SELECT m.id, m.chat_id, m.sender_id, m.is_outgoing, m.pts, m.timestamp, m.plain_text, m.signature, m.status
                     FROM messages_fts fts
                     JOIN messages m ON fts.message_id = m.id
                     WHERE messages_fts MATCH @query
@@ -236,7 +266,8 @@ namespace Messa.Core.Storage
                         Pts = reader.GetInt64(4),
                         Timestamp = reader.GetInt64(5),
                         PlainText = reader.GetString(6),
-                        Signature = reader.IsDBNull(7) ? "" : reader.GetString(7)
+                        Signature = reader.IsDBNull(7) ? "" : reader.GetString(7),
+                        Status = (MessageDeliveryStatus)reader.GetInt32(8)
                     });
                 }
             }

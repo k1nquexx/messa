@@ -3,6 +3,13 @@ using System.Text.Json.Serialization;
 
 namespace Messa.Core.Models
 {
+    public enum MessageDeliveryStatus
+    {
+        Sent = 1,      // 1 Checkmark (Server saved & sequenced)
+        Delivered = 2, // 2 Gray Checkmarks (Delivered to recipient socket)
+        Read = 3       // 2 Blue/Green Checkmarks (Recipient viewed message)
+    }
+
     public class CloudMessage
     {
         [JsonPropertyName("id")]
@@ -23,6 +30,9 @@ namespace Messa.Core.Models
         [JsonPropertyName("isOutgoing")]
         public bool IsOutgoing { get; set; }
 
+        [JsonPropertyName("status")]
+        public MessageDeliveryStatus Status { get; set; } = MessageDeliveryStatus.Sent;
+
         [JsonPropertyName("text")]
         public string Text { get; set; } = string.Empty;
 
@@ -40,5 +50,11 @@ namespace Messa.Core.Models
 
         [JsonPropertyName("timestamp")]
         public long Timestamp { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        [JsonPropertyName("deliveredAt")]
+        public long? DeliveredAt { get; set; }
+
+        [JsonPropertyName("readAt")]
+        public long? ReadAt { get; set; }
     }
 }

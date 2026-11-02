@@ -14,7 +14,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Messa.Core.Models;
 using Messa.Core.Crypto;
-using Messa.Core.Storage;
+using Messa.Server.Database;
+using Messa.Server.Messaging;
 
 namespace Messa.Server
 {
@@ -24,34 +25,64 @@ namespace Messa.Server
 
         // Multi-Device Socket Tracking: AccountFingerprint -> (DeviceId -> WebSocket)
         private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> ConnectedDevicesByAccount = new();
+        private static readonly ConcurrentDictionary<string, IDisposable> SubscriptionsByAccount = new();
 
         private static readonly string DataDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data");
-        private static readonly string KeyDirFile = Path.Combine(DataDir, "key_directory.json");
-        private static readonly string ProfilesFile = Path.Combine(DataDir, "profiles.json");
         private static readonly string TunnelFile = Path.Combine(DataDir, "tunnel.json");
 
-        // Key Directory & Pre-Key Bundles
-        private static readonly ConcurrentDictionary<string, PreKeyBundle> BundlesByFingerprint = new();
-        private static readonly ConcurrentDictionary<string, string> FingerprintByUsername = new(StringComparer.OrdinalIgnoreCase);
+        // Server Database: PostgreSQL (Npgsql) or SQLite
+        private static IServerDatabase _database = null!;
 
-        // Profiles
-        private static readonly ConcurrentDictionary<string, UserProfile> ProfilesByFingerprint = new();
+        // Event-driven Pub/Sub Broker: ChannelMessageBus or RedisMessageBus
+        private static IMessageBus _messageBus = null!;
 
-        // Telegram-style Multi-Device PTS Message Store
-        private static PtsMessageStore _ptsStore = null!;
         private static Process? _cloudflaredProcess;
 
         static async Task Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
-            Console.Title = "MESSA - Multi-Device Sovereign Cloud Relay (.NET 8)";
+            Console.Title = "MESSA - Sovereign Multi-Device Cloud Relay (.NET 8)";
 
             PrintBanner();
 
             Directory.CreateDirectory(DataDir);
-            _ptsStore = new PtsMessageStore(DataDir);
-            LoadProfiles();
-            LoadKeyDirectory();
+
+            // 1. Initialize Server Database (PostgreSQL or SQLite)
+            var pgConn = Environment.GetEnvironmentVariable("MESSA_POSTGRES_CONNECTION") ??
+                         Environment.GetEnvironmentVariable("MESSA_PG_CONNECTION");
+
+            if (!string.IsNullOrEmpty(pgConn))
+            {
+                LogInfo("Configuring PostgreSQL database backend (Npgsql)...");
+                _database = new PostgresServerDatabase(pgConn);
+            }
+            else
+            {
+                var sqlitePath = Path.Combine(DataDir, "messa_server.db");
+                LogInfo($"Configuring ACID SQLite database backend ({sqlitePath})...");
+                _database = new SqliteServerDatabase(sqlitePath);
+            }
+
+            await _database.InitializeAsync();
+            LogSuccess("Server database initialized with WAL mode & multi-device schema.");
+
+            // 2. Initialize Event-driven Pub/Sub Message Bus (Redis or In-Memory Channel)
+            var redisConn = Environment.GetEnvironmentVariable("MESSA_REDIS_CONNECTION") ??
+                            Environment.GetEnvironmentVariable("MESSA_REDIS_URL");
+
+            if (!string.IsNullOrEmpty(redisConn))
+            {
+                LogInfo($"Configuring Redis Pub/Sub cluster broker ({redisConn})...");
+                _messageBus = new RedisMessageBus(redisConn);
+            }
+            else
+            {
+                LogInfo("Configuring high-performance async Channel Message Bus (single-node broker)...");
+                _messageBus = new ChannelMessageBus();
+            }
+
+            await _messageBus.StartAsync();
+            LogSuccess("Pub/Sub Event Broker active.");
 
             StartCloudflareTunnel();
 
@@ -72,9 +103,13 @@ namespace Messa.Server
                 LogSuccess($"WebSocket Relay listening on ws://127.0.0.1:{Port}/");
             }
 
-            AppDomain.CurrentDomain.ProcessExit += (s, e) => StopCloudflareTunnel();
+            AppDomain.CurrentDomain.ProcessExit += (s, e) =>
+            {
+                StopCloudflareTunnel();
+                _messageBus.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            };
 
-            LogInfo("Relay is active: Multi-Device Sync (PTS sequence) and Challenge-Response Handshake enabled.");
+            LogInfo("Relay is active: Delivery status tracking (Sent/Delivered/Read) and Pub/Sub cluster scaling enabled.");
 
             while (true)
             {
@@ -87,7 +122,7 @@ namespace Messa.Server
                     }
                     else
                     {
-                        var resp = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"service\":\"MESSA Multi-Device Sovereign Cloud Relay\"}");
+                        var resp = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"service\":\"MESSA Sovereign Cloud Relay\",\"cluster\":true}");
                         context.Response.ContentType = "application/json";
                         context.Response.ContentLength64 = resp.Length;
                         await context.Response.OutputStream.WriteAsync(resp);
@@ -170,7 +205,8 @@ namespace Messa.Server
                 }
 
                 // Verify 3: SRP-6a 2FA Cloud Password (if enabled)
-                if (ProfilesByFingerprint.TryGetValue(authPacket.Fingerprint, out var userProfile) && userProfile.Has2FA)
+                var userProfile = await _database.GetUserAsync(authPacket.Fingerprint);
+                if (userProfile != null && userProfile.Has2FA)
                 {
                     if (string.IsNullOrEmpty(authPacket.TwoFactorProof) || string.IsNullOrEmpty(authPacket.TwoFactorA))
                     {
@@ -205,26 +241,25 @@ namespace Messa.Server
                 var devices = ConnectedDevicesByAccount.GetOrAdd(authenticatedFingerprint, _ => new ConcurrentDictionary<string, WebSocket>());
                 devices[deviceId] = webSocket;
 
-                var totalDevices = devices.Count;
-                LogSuccess($"[AUTH OK] Account: {authenticatedFingerprint[..8]}... Device: {deviceId} connected (Total online devices for account: {totalDevices})");
+                // Subscribe this node to Pub/Sub events for this account if not already subscribed
+                EnsureAccountSubscribed(authenticatedFingerprint);
 
-                if (!ProfilesByFingerprint.TryGetValue(authenticatedFingerprint, out userProfile))
+                var totalDevices = devices.Count;
+                LogSuccess($"[AUTH OK] Account: {authenticatedFingerprint[..8]}... Device: {deviceId} connected (Total online devices: {totalDevices})");
+
+                if (userProfile == null)
                 {
                     userProfile = new UserProfile
                     {
                         Fingerprint = authenticatedFingerprint,
                         Username = authPacket.Username ?? "",
-                        DisplayName = authPacket.Username ?? authenticatedFingerprint[..8]
+                        DisplayName = authPacket.Username ?? authenticatedFingerprint[..8],
+                        UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                     };
-                    ProfilesByFingerprint[authenticatedFingerprint] = userProfile;
-                    if (!string.IsNullOrEmpty(userProfile.Username))
-                    {
-                        FingerprintByUsername[userProfile.Username] = authenticatedFingerprint;
-                    }
-                    SaveProfiles();
+                    await _database.SaveUserAsync(userProfile);
                 }
 
-                var currentPts = _ptsStore.GetCurrentPts(authenticatedFingerprint);
+                var currentPts = await _database.GetCurrentPtsAsync(authenticatedFingerprint);
 
                 // Send auth_success with current PTS
                 await SendJsonAsync(webSocket, new ProtocolPacket
@@ -245,7 +280,7 @@ namespace Messa.Server
                     {
                         case "get_difference":
                             var fromPts = packet.FromPts ?? 0;
-                            var (diffMessages, latestPts) = _ptsStore.GetDifference(authenticatedFingerprint, fromPts);
+                            var (diffMessages, latestPts) = await _database.GetDifferenceAsync(authenticatedFingerprint, fromPts);
                             await SendJsonAsync(webSocket, new ProtocolPacket
                             {
                                 Type = "difference_result",
@@ -264,75 +299,124 @@ namespace Messa.Server
                                 var iv = packet.CloudMessage?.IvBase64 ?? "";
                                 var sig = packet.CloudMessage?.SignatureBase64 ?? "";
                                 var plainText = packet.CloudMessage?.Text ?? "";
+                                var clientMsgId = packet.CloudMessage?.Id;
 
                                 if (!string.IsNullOrEmpty(recipientFp))
                                 {
-                                    // Store and sequence for both recipient and sender accounts
-                                    var (recipientRecord, senderRecord) = _ptsStore.StoreAndSequenceMessage(
+                                    // 1. ACID Store & Sequence: Status is initially 'Sent' (1 checkmark)
+                                    var (recipientRecord, senderRecord) = await _database.StoreAndSequenceMessageAsync(
                                         authenticatedFingerprint,
                                         recipientFp,
                                         ciphertext,
                                         tag,
                                         iv,
                                         sig,
-                                        plainText);
+                                        plainText,
+                                        clientMsgId);
 
-                                    // 1. Fan-out to ALL active devices of Recipient
-                                    if (ConnectedDevicesByAccount.TryGetValue(recipientFp, out var recipientDeviceDict))
+                                    // 2. Deliver to Recipient's devices via Pub/Sub broker
+                                    await _messageBus.PublishAsync($"user:{recipientFp}", new ProtocolPacket
                                     {
-                                        foreach (var kvp in recipientDeviceDict)
-                                        {
-                                            if (kvp.Value.State == WebSocketState.Open)
-                                            {
-                                                _ = SendJsonAsync(kvp.Value, new ProtocolPacket
-                                                {
-                                                    Type = "new_message",
-                                                    CloudMessage = recipientRecord,
-                                                    Pts = recipientRecord.Pts
-                                                });
-                                            }
-                                        }
-                                    }
+                                        Type = "new_message",
+                                        CloudMessage = recipientRecord,
+                                        Pts = recipientRecord.Pts
+                                    });
 
-                                    // 2. Multi-device sync: Fan-out echo to ALL OTHER devices of Sender (e.g. PC if sent from Phone)
-                                    if (ConnectedDevicesByAccount.TryGetValue(authenticatedFingerprint, out var senderDeviceDict))
+                                    // 3. Multi-device sync: Fan-out echo to ALL OTHER devices of Sender (e.g. PC if sent from Phone)
+                                    await _messageBus.PublishAsync($"user:{authenticatedFingerprint}", new ProtocolPacket
                                     {
-                                        foreach (var kvp in senderDeviceDict)
-                                        {
-                                            if (kvp.Key != deviceId && kvp.Value.State == WebSocketState.Open)
-                                            {
-                                                _ = SendJsonAsync(kvp.Value, new ProtocolPacket
-                                                {
-                                                    Type = "new_message",
-                                                    CloudMessage = senderRecord,
-                                                    Pts = senderRecord.Pts
-                                                });
-                                            }
-                                        }
-                                    }
+                                        Type = "new_message",
+                                        CloudMessage = senderRecord,
+                                        Pts = senderRecord.Pts,
+                                        DeviceId = deviceId
+                                    });
 
-                                    // Acknowledge sending socket
+                                    // 4. Acknowledge sending socket with Sent status (1 checkmark)
                                     await SendJsonAsync(webSocket, new ProtocolPacket
                                     {
                                         Type = "status",
-                                        Status = "delivered",
-                                        Pts = senderRecord.Pts
+                                        Status = "sent",
+                                        MessageId = recipientRecord.Id,
+                                        Pts = senderRecord.Pts,
+                                        DeliveryStatus = MessageDeliveryStatus.Sent
                                     });
 
-                                    LogInfo($"[MSG ROUTED] From {authenticatedFingerprint[..8]} to {recipientFp[..8]} (Sender Pts: {senderRecord.Pts}, Recipient Pts: {recipientRecord.Pts})");
+                                    // 5. If recipient is currently online, mark as Delivered immediately
+                                    bool isRecipientOnline = ConnectedDevicesByAccount.ContainsKey(recipientFp);
+                                    if (isRecipientOnline)
+                                    {
+                                        await _database.UpdateMessageStatusAsync(recipientRecord.Id, recipientFp, MessageDeliveryStatus.Delivered);
+
+                                        // Notify sender devices: Delivered (2 gray checkmarks)
+                                        await _messageBus.PublishAsync($"user:{authenticatedFingerprint}", new ProtocolPacket
+                                        {
+                                            Type = "message_status_update",
+                                            MessageId = recipientRecord.Id,
+                                            ChatId = recipientFp,
+                                            DeliveryStatus = MessageDeliveryStatus.Delivered
+                                        });
+                                    }
+
+                                    LogInfo($"[MSG ROUTED] From {authenticatedFingerprint[..8]} to {recipientFp[..8]} (Sender Pts: {senderRecord.Pts}, Recipient Pts: {recipientRecord.Pts}, Status: {(isRecipientOnline ? "Delivered" : "Sent")})");
                                 }
+                            }
+                            break;
+
+                        case "delivery_receipt":
+                            if (!string.IsNullOrEmpty(packet.MessageId))
+                            {
+                                var peerChatId = packet.ChatId ?? "";
+                                await _database.UpdateMessageStatusAsync(packet.MessageId, peerChatId, MessageDeliveryStatus.Delivered);
+
+                                if (!string.IsNullOrEmpty(peerChatId))
+                                {
+                                    await _messageBus.PublishAsync($"user:{peerChatId}", new ProtocolPacket
+                                    {
+                                        Type = "message_status_update",
+                                        MessageId = packet.MessageId,
+                                        ChatId = authenticatedFingerprint,
+                                        DeliveryStatus = MessageDeliveryStatus.Delivered
+                                    });
+                                }
+                            }
+                            break;
+
+                        case "read_receipt":
+                            if (!string.IsNullOrEmpty(packet.MessageId))
+                            {
+                                var peerChatId = packet.ChatId ?? "";
+                                await _database.UpdateMessageStatusAsync(packet.MessageId, peerChatId, MessageDeliveryStatus.Read);
+
+                                // 1. Notify the message sender that Bob has read it (2 green/blue checkmarks)
+                                if (!string.IsNullOrEmpty(peerChatId))
+                                {
+                                    await _messageBus.PublishAsync($"user:{peerChatId}", new ProtocolPacket
+                                    {
+                                        Type = "message_status_update",
+                                        MessageId = packet.MessageId,
+                                        ChatId = authenticatedFingerprint,
+                                        DeliveryStatus = MessageDeliveryStatus.Read
+                                    });
+                                }
+
+                                // 2. Sync read status across Bob's other devices
+                                await _messageBus.PublishAsync($"user:{authenticatedFingerprint}", new ProtocolPacket
+                                {
+                                    Type = "message_status_update",
+                                    MessageId = packet.MessageId,
+                                    ChatId = peerChatId,
+                                    DeliveryStatus = MessageDeliveryStatus.Read,
+                                    DeviceId = deviceId
+                                });
+
+                                LogInfo($"[READ RECEIPT] Message {packet.MessageId[..8]} marked read by {authenticatedFingerprint[..8]}");
                             }
                             break;
 
                         case "publish_bundle":
                             if (packet.Bundle != null && packet.Bundle.Verify())
                             {
-                                BundlesByFingerprint[authenticatedFingerprint] = packet.Bundle;
-                                if (!string.IsNullOrEmpty(packet.Bundle.Username))
-                                {
-                                    FingerprintByUsername[packet.Bundle.Username] = authenticatedFingerprint;
-                                }
-                                SaveKeyDirectory();
+                                await _database.SavePreKeyBundleAsync(packet.Bundle);
                                 LogSuccess($"[KEY-DIR] Published verified PreKey bundle for @{packet.Bundle.Username}");
                                 await SendJsonAsync(webSocket, new ProtocolPacket { Type = "status", Status = "bundle_published" });
                             }
@@ -341,14 +425,10 @@ namespace Messa.Server
                         case "lookup_bundle":
                             if (!string.IsNullOrEmpty(packet.Query))
                             {
-                                var q = packet.Query.Trim().TrimStart('@');
-                                PreKeyBundle? b = null;
-                                if (BundlesByFingerprint.TryGetValue(q, out var b1)) b = b1;
-                                else if (FingerprintByUsername.TryGetValue(q, out var fp) && BundlesByFingerprint.TryGetValue(fp, out var b2)) b = b2;
-
-                                if (b != null)
+                                var bundle = await _database.GetPreKeyBundleAsync(packet.Query);
+                                if (bundle != null)
                                 {
-                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "bundle_result", Bundle = b });
+                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "bundle_result", Bundle = bundle });
                                 }
                                 else
                                 {
@@ -379,12 +459,7 @@ namespace Messa.Server
                                     LogInfo($"[2FA] Disabled Cloud Password for {p.Username}");
                                 }
 
-                                ProfilesByFingerprint[authenticatedFingerprint] = p;
-                                if (!string.IsNullOrEmpty(p.Username))
-                                {
-                                    FingerprintByUsername[p.Username] = authenticatedFingerprint;
-                                }
-                                SaveProfiles();
+                                await _database.SaveUserAsync(p);
                                 await SendJsonAsync(webSocket, new ProtocolPacket { Type = "profile_updated", Profile = p });
                             }
                             break;
@@ -392,14 +467,7 @@ namespace Messa.Server
                         case "search_users":
                             if (!string.IsNullOrEmpty(packet.Query))
                             {
-                                var q = packet.Query.Trim().TrimStart('@');
-                                var matches = ProfilesByFingerprint.Values
-                                    .Where(pr => pr.Username.Contains(q, StringComparison.OrdinalIgnoreCase) ||
-                                                 pr.DisplayName.Contains(q, StringComparison.OrdinalIgnoreCase) ||
-                                                 pr.Fingerprint.Equals(q, StringComparison.OrdinalIgnoreCase))
-                                    .Take(20)
-                                    .ToList();
-
+                                var matches = await _database.SearchUsersAsync(packet.Query, 20);
                                 await SendJsonAsync(webSocket, new ProtocolPacket
                                 {
                                     Type = "search_results",
@@ -428,12 +496,46 @@ namespace Messa.Server
                         if (devDict.IsEmpty)
                         {
                             ConnectedDevicesByAccount.TryRemove(authenticatedFingerprint, out _);
+                            if (SubscriptionsByAccount.TryRemove(authenticatedFingerprint, out var sub))
+                            {
+                                sub.Dispose();
+                            }
                         }
                     }
                     LogInfo($"Device {deviceId} disconnected for account {authenticatedFingerprint[..8]}...");
                 }
                 webSocket.Dispose();
             }
+        }
+
+        private static void EnsureAccountSubscribed(string accountFp)
+        {
+            SubscriptionsByAccount.GetOrAdd(accountFp, fp =>
+            {
+                return _messageBus.Subscribe($"user:{fp}", async packet =>
+                {
+                    if (ConnectedDevicesByAccount.TryGetValue(fp, out var devDict))
+                    {
+                        foreach (var kvp in devDict)
+                        {
+                            // If packet specified DeviceId to skip (e.g. echo packet from self), skip that device
+                            if (!string.IsNullOrEmpty(packet.DeviceId) && packet.DeviceId == kvp.Key && packet.Type == "new_message")
+                            {
+                                continue;
+                            }
+
+                            if (kvp.Value.State == WebSocketState.Open)
+                            {
+                                try
+                                {
+                                    await SendJsonAsync(kvp.Value, packet);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                });
+            });
         }
 
         private static async Task<ProtocolPacket?> ReceivePacketAsync(WebSocket socket, CancellationToken ct)
@@ -457,73 +559,6 @@ namespace Messa.Server
             if (socket.State != WebSocketState.Open) return;
             var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
             await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-        }
-
-        private static void LoadProfiles()
-        {
-            if (File.Exists(ProfilesFile))
-            {
-                try
-                {
-                    var data = JsonSerializer.Deserialize<Dictionary<string, UserProfile>>(File.ReadAllText(ProfilesFile));
-                    if (data != null)
-                    {
-                        foreach (var kvp in data)
-                        {
-                            ProfilesByFingerprint[kvp.Key] = kvp.Value;
-                            if (!string.IsNullOrEmpty(kvp.Value.Username))
-                            {
-                                FingerprintByUsername[kvp.Value.Username] = kvp.Key;
-                            }
-                        }
-                        LogInfo($"Loaded {ProfilesByFingerprint.Count} user profile(s).");
-                    }
-                }
-                catch { }
-            }
-        }
-
-        private static void SaveProfiles()
-        {
-            try
-            {
-                var dict = new Dictionary<string, UserProfile>(ProfilesByFingerprint);
-                File.WriteAllText(ProfilesFile, JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true }));
-            }
-            catch { }
-        }
-
-        private static void LoadKeyDirectory()
-        {
-            if (File.Exists(KeyDirFile))
-            {
-                try
-                {
-                    var data = JsonSerializer.Deserialize<Dictionary<string, PreKeyBundle>>(File.ReadAllText(KeyDirFile));
-                    if (data != null)
-                    {
-                        foreach (var kvp in data)
-                        {
-                            BundlesByFingerprint[kvp.Key] = kvp.Value;
-                            if (!string.IsNullOrEmpty(kvp.Value.Username))
-                            {
-                                FingerprintByUsername[kvp.Value.Username] = kvp.Key;
-                            }
-                        }
-                    }
-                }
-                catch { }
-            }
-        }
-
-        private static void SaveKeyDirectory()
-        {
-            try
-            {
-                var dict = new Dictionary<string, PreKeyBundle>(BundlesByFingerprint);
-                File.WriteAllText(KeyDirFile, JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true }));
-            }
-            catch { }
         }
 
         private static void StartCloudflareTunnel()
@@ -562,7 +597,7 @@ namespace Messa.Server
             try { _cloudflaredProcess?.Kill(true); } catch { }
         }
 
-        private static void PrintBanner() => Console.WriteLine("\n[MESSA] Sovereign Multi-Device Cloud Relay (Telegram PTS Architecture)\n");
+        private static void PrintBanner() => Console.WriteLine("\n[MESSA] Sovereign Multi-Device Cloud Relay (PostgreSQL / SQLite + Pub/Sub)\n");
         private static void LogInfo(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [INFO] {m}");
         private static void LogSuccess(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [OK] {m}");
         private static void LogWarn(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [WARN] {m}");
