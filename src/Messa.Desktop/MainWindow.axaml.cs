@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Net.WebSockets;
@@ -22,6 +23,7 @@ namespace Messa.Desktop
         public string Header { get; set; } = string.Empty;
         public string Text { get; set; } = string.Empty;
         public string Time { get; set; } = string.Empty;
+        public string StatusBadge { get; set; } = string.Empty;
         public IBrush BackgroundColor { get; set; } = new SolidColorBrush(Color.Parse("#1F2937"));
         public HorizontalAlignment Alignment { get; set; } = HorizontalAlignment.Left;
     }
@@ -34,6 +36,14 @@ namespace Messa.Desktop
         private readonly ObservableCollection<ChatMessage> _messages = new();
         private readonly string _keyFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Messa", "identity.json");
 
+        // Double Ratchet Sessions by Peer Fingerprint
+        private readonly ConcurrentDictionary<string, DoubleRatchetSession> _sessions = new();
+        private string? _activePeerFingerprint;
+        private string? _activePeerUsername;
+
+        // Pending lookup completions
+        private TaskCompletionSource<PreKeyBundle?>? _pendingLookup;
+
         public MainWindow()
         {
             InitializeComponent();
@@ -41,8 +51,9 @@ namespace Messa.Desktop
 
             _myKey = LoadOrCreateIdentity();
             MyFingerprintBox.Text = _myKey.Fingerprint;
+            UsernameBox.Text = _myKey.Username;
 
-            AddSystemMessage("App initialized. Ready to connect via native WSS.");
+            AddSystemMessage("Double Ratchet & ECDSA Signature engine ready.");
         }
 
         private IdentityKey LoadOrCreateIdentity()
@@ -54,22 +65,26 @@ namespace Messa.Desktop
 
                 if (File.Exists(_keyFile))
                 {
-                    var json = File.ReadAllText(_keyFile);
-                    var key = JsonSerializer.Deserialize<IdentityKey>(json);
-                    if (key != null) return key;
+                    var key = JsonSerializer.Deserialize<IdentityKey>(File.ReadAllText(_keyFile));
+                    if (key != null && !string.IsNullOrEmpty(key.SignedPreKeyPrivateKeyBase64)) return key;
                 }
             }
             catch { }
 
             var newKey = IdentityKey.Generate();
+            SaveIdentity(newKey);
+            return newKey;
+        }
+
+        private void SaveIdentity(IdentityKey key)
+        {
             try
             {
-                var json = JsonSerializer.Serialize(newKey, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(_keyFile, json);
+                var dir = Path.GetDirectoryName(_keyFile);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(_keyFile, JsonSerializer.Serialize(key, new JsonSerializerOptions { WriteIndented = true }));
             }
             catch { }
-
-            return newKey;
         }
 
         private async void OnConnectClicked(object? sender, RoutedEventArgs e)
@@ -92,20 +107,14 @@ namespace Messa.Desktop
                 _cts = new CancellationTokenSource();
                 _webSocket = new ClientWebSocket();
 
-                // If connecting over secure WSS without standard validation check in local dev
-                if (serverUrl.StartsWith("ws://127.0.0.1") || serverUrl.StartsWith("ws://localhost"))
-                {
-                    // standard ws
-                }
-
                 await _webSocket.ConnectAsync(new Uri(serverUrl), _cts.Token);
 
-                // Register with Relay
+                // Register client with server
                 var regPacket = new ProtocolPacket
                 {
                     Type = "register",
                     Fingerprint = _myKey.Fingerprint,
-                    PublicKey = _myKey.PublicKeyBase64
+                    Username = _myKey.Username
                 };
                 await SendJsonAsync(regPacket);
 
@@ -113,7 +122,13 @@ namespace Messa.Desktop
                 StatusText.Text = "Connected";
                 ConnectBtn.Content = "Disconnect";
                 ConnectBtn.IsEnabled = true;
-                AddSystemMessage($"Connected to {serverUrl} via native ClientWebSocket.");
+                AddSystemMessage($"Connected to {serverUrl}.");
+
+                // Auto-publish profile if username is specified
+                if (!string.IsNullOrEmpty(_myKey.Username))
+                {
+                    await PublishProfileInternalAsync();
+                }
 
                 _ = ReceiveLoopAsync(_webSocket, _cts.Token);
             }
@@ -122,7 +137,7 @@ namespace Messa.Desktop
                 StatusDot.Fill = new SolidColorBrush(Color.Parse("#FF4D4D"));
                 StatusText.Text = "Connection Failed";
                 ConnectBtn.IsEnabled = true;
-                AddSystemMessage($"Error: {ex.Message}");
+                AddSystemMessage($"Connection error: {ex.Message}");
             }
         }
 
@@ -133,7 +148,7 @@ namespace Messa.Desktop
                 _cts?.Cancel();
                 if (_webSocket != null && _webSocket.State == WebSocketState.Open)
                 {
-                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed by user", CancellationToken.None);
+                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
                 }
             }
             catch { }
@@ -145,7 +160,91 @@ namespace Messa.Desktop
                 StatusText.Text = "Disconnected";
                 ConnectBtn.Content = "Connect";
                 ConnectBtn.IsEnabled = true;
-                AddSystemMessage("Disconnected from server.");
+                AddSystemMessage("Disconnected from relay.");
+            }
+        }
+
+        private async void OnPublishProfileClicked(object? sender, RoutedEventArgs e)
+        {
+            var username = UsernameBox.Text?.Trim().TrimStart('@') ?? "";
+            _myKey.Username = username;
+            SaveIdentity(_myKey);
+
+            if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+            {
+                AddSystemMessage("Cannot publish: please connect to server first.");
+                return;
+            }
+
+            await PublishProfileInternalAsync();
+        }
+
+        private async Task PublishProfileInternalAsync()
+        {
+            var bundle = PreKeyBundle.Create(_myKey);
+            var packet = new ProtocolPacket
+            {
+                Type = "publish_bundle",
+                Bundle = bundle
+            };
+            await SendJsonAsync(packet);
+            AddSystemMessage($"Published PreKey Bundle for @{_myKey.Username} to Server Directory.");
+        }
+
+        private async void OnInitRatchetClicked(object? sender, RoutedEventArgs e)
+        {
+            var query = PeerSearchBox.Text?.Trim();
+            if (string.IsNullOrEmpty(query)) return;
+
+            if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+            {
+                AddSystemMessage("Please connect to server first.");
+                return;
+            }
+
+            AddSystemMessage($"Looking up PreKey Bundle for '{query}' in Server Directory...");
+            _pendingLookup = new TaskCompletionSource<PreKeyBundle?>();
+
+            await SendJsonAsync(new ProtocolPacket
+            {
+                Type = "lookup_bundle",
+                Query = query
+            });
+
+            var completedTask = await Task.WhenAny(_pendingLookup.Task, Task.Delay(5000));
+            if (completedTask == _pendingLookup.Task)
+            {
+                var bundle = await _pendingLookup.Task;
+                if (bundle != null)
+                {
+                    // Verify bundle signature
+                    if (!bundle.Verify())
+                    {
+                        AddSystemMessage("❌ SECURITY WARNING: PreKey bundle signature verification failed!");
+                        return;
+                    }
+
+                    try
+                    {
+                        var session = DoubleRatchetSession.Initiate(_myKey, bundle);
+                        _sessions[bundle.Fingerprint] = session;
+                        _activePeerFingerprint = bundle.Fingerprint;
+                        _activePeerUsername = string.IsNullOrEmpty(bundle.Username) ? bundle.Fingerprint[..8] : $"@{bundle.Username}";
+
+                        ActivePeerLabel.Text = $"Chatting with: {_activePeerUsername} (Double Ratchet Active 🔒)";
+                        ActivePeerLabel.Foreground = new SolidColorBrush(Color.Parse("#34D399"));
+
+                        AddSystemMessage($"✅ Double Ratchet Session initialized with {_activePeerUsername}! Forward Secrecy & Break-in Recovery active.");
+                    }
+                    catch (Exception ex)
+                    {
+                        AddSystemMessage($"Failed to initiate ratchet: {ex.Message}");
+                    }
+                }
+            }
+            else
+            {
+                AddSystemMessage("Lookup timed out. User might not exist or be registered.");
             }
         }
 
@@ -173,7 +272,6 @@ namespace Messa.Desktop
 
                     var json = Encoding.UTF8.GetString(ms.ToArray());
                     var packet = JsonSerializer.Deserialize<ProtocolPacket>(json);
-
                     if (packet != null)
                     {
                         await ProcessIncomingPacketAsync(packet);
@@ -186,64 +284,112 @@ namespace Messa.Desktop
                 {
                     Dispatcher.UIThread.Post(() =>
                     {
-                        AddSystemMessage($"Receive loop terminated: {ex.Message}");
+                        AddSystemMessage($"Disconnected: {ex.Message}");
                         _ = DisconnectAsync();
                     });
                 }
             }
         }
 
-        private Task ProcessIncomingPacketAsync(ProtocolPacket packet)
+        private async Task ProcessIncomingPacketAsync(ProtocolPacket packet)
         {
-            Dispatcher.UIThread.Post(() =>
+            switch (packet.Type)
             {
-                switch (packet.Type)
-                {
-                    case "message":
-                        if (packet.Envelope != null)
-                        {
-                            try
-                            {
-                                var decrypted = E2eeEngine.Decrypt(packet.Envelope, _myKey);
-                                var senderFp = packet.Envelope.SenderFingerprint;
-                                var shortSender = senderFp[..Math.Min(8, senderFp.Length)];
+                case "bundle_result":
+                    _pendingLookup?.TrySetResult(packet.Bundle);
+                    break;
 
-                                _messages.Add(new ChatMessage
-                                {
-                                    Header = $"From: {shortSender}...",
-                                    Text = decrypted,
-                                    Time = DateTime.Now.ToString("HH:mm"),
-                                    BackgroundColor = new SolidColorBrush(Color.Parse("#232D3F")),
-                                    Alignment = HorizontalAlignment.Left
-                                });
-                            }
-                            catch (Exception ex)
-                            {
-                                AddSystemMessage($"[E2EE Decrypt Error]: {ex.Message}");
-                            }
-                        }
-                        break;
+                case "error":
+                    _pendingLookup?.TrySetResult(null);
+                    Dispatcher.UIThread.Post(() => AddSystemMessage($"Server error: {packet.Error}"));
+                    break;
 
-                    case "status":
-                        AddSystemMessage($"Server status: {packet.Status}");
-                        break;
-                }
-            });
+                case "status":
+                    Dispatcher.UIThread.Post(() => AddSystemMessage($"Server: {packet.Status}"));
+                    break;
 
-            return Task.CompletedTask;
+                case "ratchet_message":
+                    if (packet.RatchetMessage != null)
+                    {
+                        await HandleIncomingRatchetMessageAsync(packet);
+                    }
+                    break;
+            }
         }
 
-        private async void OnSendClicked(object? sender, RoutedEventArgs e)
+        private async Task HandleIncomingRatchetMessageAsync(ProtocolPacket packet)
         {
-            await SendCurrentMessageAsync();
+            var msg = packet.RatchetMessage!;
+            var senderFp = msg.SenderFingerprint;
+
+            // Check if we have an active session with this peer
+            if (!_sessions.TryGetValue(senderFp, out var session))
+            {
+                // We need sender's Identity Signing & DH keys
+                if (string.IsNullOrEmpty(packet.SenderIdentityDhKeyBase64))
+                {
+                    Dispatcher.UIThread.Post(() => AddSystemMessage("Received message without sender DH key material."));
+                    return;
+                }
+
+                // Lookup sender's bundle from Key Directory
+                _pendingLookup = new TaskCompletionSource<PreKeyBundle?>();
+                await SendJsonAsync(new ProtocolPacket { Type = "lookup_bundle", Query = senderFp });
+
+                var senderBundle = await _pendingLookup.Task;
+                if (senderBundle == null || !senderBundle.Verify())
+                {
+                    Dispatcher.UIThread.Post(() => AddSystemMessage("❌ Cannot verify sender's PreKey Bundle!"));
+                    return;
+                }
+
+                session = DoubleRatchetSession.Accept(
+                    _myKey,
+                    senderFp,
+                    senderBundle.IdentitySigningKeyBase64,
+                    packet.SenderIdentityDhKeyBase64,
+                    Convert.FromBase64String(msg.DhPublicKeyBase64));
+
+                _sessions[senderFp] = session;
+                _activePeerFingerprint = senderFp;
+                _activePeerUsername = string.IsNullOrEmpty(senderBundle.Username) ? senderFp[..8] : $"@{senderBundle.Username}";
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    ActivePeerLabel.Text = $"Chatting with: {_activePeerUsername} (Double Ratchet Active 🔒)";
+                    ActivePeerLabel.Foreground = new SolidColorBrush(Color.Parse("#34D399"));
+                });
+            }
+
+            try
+            {
+                var decrypted = session.Decrypt(msg);
+                var peerDisplay = _activePeerUsername ?? senderFp[..8];
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    _messages.Add(new ChatMessage
+                    {
+                        Header = $"From: {peerDisplay}",
+                        Text = decrypted,
+                        Time = DateTime.Now.ToString("HH:mm"),
+                        StatusBadge = $"Verified ECDSA • Ratchet #{msg.MessageNumber}",
+                        BackgroundColor = new SolidColorBrush(Color.Parse("#232D3F")),
+                        Alignment = HorizontalAlignment.Left
+                    });
+                });
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.UIThread.Post(() => AddSystemMessage($"❌ Decrypt / Signature Error: {ex.Message}"));
+            }
         }
+
+        private async void OnSendClicked(object? sender, RoutedEventArgs e) => await SendCurrentMessageAsync();
 
         private async void OnMessageInputKeyDown(object? sender, KeyEventArgs e)
         {
-            if (e.Key == Key.Enter)
-            {
-                await SendCurrentMessageAsync();
-            }
+            if (e.Key == Key.Enter) await SendCurrentMessageAsync();
         }
 
         private async Task SendCurrentMessageAsync()
@@ -253,28 +399,26 @@ namespace Messa.Desktop
 
             if (_webSocket == null || _webSocket.State != WebSocketState.Open)
             {
-                AddSystemMessage("Cannot send: not connected to relay server.");
+                AddSystemMessage("Cannot send: not connected to relay.");
                 return;
             }
 
-            var recipientId = RecipientIdBox.Text?.Trim();
-            var recipientPubKey = RecipientPubKeyBox.Text?.Trim();
-
-            if (string.IsNullOrEmpty(recipientId) || string.IsNullOrEmpty(recipientPubKey))
+            if (string.IsNullOrEmpty(_activePeerFingerprint) || !_sessions.TryGetValue(_activePeerFingerprint, out var session))
             {
-                AddSystemMessage("Please enter Recipient ID and Recipient Public Key first.");
+                AddSystemMessage("Please find a contact with 'Find & Init Ratchet' before sending.");
                 return;
             }
 
             try
             {
-                // Encrypt message using AES-256-GCM + ECDH P-256
-                var envelope = E2eeEngine.Encrypt(text, recipientPubKey, _myKey, recipientId);
+                // Encrypt via Double Ratchet + sign with ECDSA P-256
+                var msg = session.Encrypt(text, _myKey);
 
                 var packet = new ProtocolPacket
                 {
-                    Type = "send",
-                    Envelope = envelope
+                    Type = "ratchet_message",
+                    RatchetMessage = msg,
+                    SenderIdentityDhKeyBase64 = _myKey.DhPublicKeyBase64
                 };
 
                 await SendJsonAsync(packet);
@@ -284,6 +428,7 @@ namespace Messa.Desktop
                     Header = "Me",
                     Text = text,
                     Time = DateTime.Now.ToString("HH:mm"),
+                    StatusBadge = $"Signed ECDSA • Ratchet #{msg.MessageNumber}",
                     BackgroundColor = new SolidColorBrush(Color.Parse("#2B5278")),
                     Alignment = HorizontalAlignment.Right
                 });
@@ -292,25 +437,15 @@ namespace Messa.Desktop
             }
             catch (Exception ex)
             {
-                AddSystemMessage($"[Encryption Error]: {ex.Message}");
+                AddSystemMessage($"Encryption Error: {ex.Message}");
             }
         }
 
         private async Task SendJsonAsync(ProtocolPacket packet)
         {
             if (_webSocket == null || _webSocket.State != WebSocketState.Open) return;
-            var json = JsonSerializer.Serialize(packet);
-            var bytes = Encoding.UTF8.GetBytes(json);
+            var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
             await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-        }
-
-        private void OnCopyIdClicked(object? sender, RoutedEventArgs e)
-        {
-            if (Clipboard != null)
-            {
-                _ = Clipboard.SetTextAsync(_myKey.Fingerprint);
-                AddSystemMessage("Copied Fingerprint to Clipboard!");
-            }
         }
 
         private void AddSystemMessage(string text)

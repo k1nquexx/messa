@@ -20,8 +20,15 @@ namespace Messa.Server
         private static readonly ConcurrentDictionary<string, WebSocket> ConnectedClients = new();
         private static readonly string DataDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data");
         private static readonly string DeadDropFile = Path.Combine(DataDir, "deaddrop.json");
+        private static readonly string KeyDirFile = Path.Combine(DataDir, "key_directory.json");
         private static readonly string TunnelFile = Path.Combine(DataDir, "tunnel.json");
-        private static readonly ConcurrentDictionary<string, List<EncryptedEnvelope>> OfflineQueue = new();
+
+        // Key Directory & Pre-Key Bundles
+        private static readonly ConcurrentDictionary<string, PreKeyBundle> BundlesByFingerprint = new();
+        private static readonly ConcurrentDictionary<string, string> FingerprintByUsername = new(StringComparer.OrdinalIgnoreCase);
+
+        // Offline Dead-Drop queue
+        private static readonly ConcurrentDictionary<string, List<ProtocolPacket>> OfflineQueue = new();
         private static Process? _cloudflaredProcess;
 
         static async Task Main(string[] args)
@@ -32,23 +39,20 @@ namespace Messa.Server
             PrintBanner();
 
             Directory.CreateDirectory(DataDir);
+            LoadKeyDirectory();
             LoadOfflineQueue();
 
-            // Start Cloudflare Tunnel if available
             StartCloudflareTunnel();
 
-            // Start WebSocket Server via HttpListener
             var httpListener = new HttpListener();
-            var prefix = $"http://*:{Port}/";
             try
             {
-                httpListener.Prefixes.Add(prefix);
+                httpListener.Prefixes.Add($"http://*:{Port}/");
                 httpListener.Start();
                 LogSuccess($"WebSocket Relay listening on ws://0.0.0.0:{Port}/");
             }
-            catch (Exception ex)
+            catch
             {
-                LogWarn($"Failed to bind wildcard prefix ({ex.Message}), falling back to localhost...");
                 httpListener.Close();
                 httpListener = new HttpListener();
                 httpListener.Prefixes.Add($"http://localhost:{Port}/");
@@ -57,17 +61,7 @@ namespace Messa.Server
                 LogSuccess($"WebSocket Relay listening on ws://127.0.0.1:{Port}/");
             }
 
-            AppDomain.CurrentDomain.ProcessExit += (s, e) =>
-            {
-                StopCloudflareTunnel();
-            };
-
-            Console.CancelKeyPress += (s, e) =>
-            {
-                e.Cancel = true;
-                StopCloudflareTunnel();
-                Environment.Exit(0);
-            };
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => StopCloudflareTunnel();
 
             LogInfo("Server is operational. Waiting for client connections...");
 
@@ -82,11 +76,10 @@ namespace Messa.Server
                     }
                     else
                     {
-                        // Simple HTTP status endpoint
-                        var responseBytes = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"service\":\"MESSA Sovereign Relay Server\"}");
+                        var resp = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"service\":\"MESSA Sovereign Relay Server\"}");
                         context.Response.ContentType = "application/json";
-                        context.Response.ContentLength64 = responseBytes.Length;
-                        await context.Response.OutputStream.WriteAsync(responseBytes);
+                        context.Response.ContentLength64 = resp.Length;
+                        await context.Response.OutputStream.WriteAsync(resp);
                         context.Response.Close();
                     }
                 }
@@ -114,8 +107,7 @@ namespace Messa.Server
 
             var webSocket = webSocketContext.WebSocket;
             string? clientFingerprint = null;
-
-            var buffer = new byte[1024 * 64]; // 64 KB buffer
+            var buffer = new byte[1024 * 64];
 
             try
             {
@@ -136,7 +128,6 @@ namespace Messa.Server
 
                     var messageJson = Encoding.UTF8.GetString(ms.ToArray());
                     var packet = JsonSerializer.Deserialize<ProtocolPacket>(messageJson);
-
                     if (packet == null) continue;
 
                     switch (packet.Type)
@@ -147,36 +138,75 @@ namespace Messa.Server
                                 clientFingerprint = packet.Fingerprint;
                                 ConnectedClients[clientFingerprint] = webSocket;
                                 LogSuccess($"Client registered: {clientFingerprint[..Math.Min(16, clientFingerprint.Length)]}...");
-
-                                // Flush dead-drop queue for this client
                                 await DeliverOfflineMessagesAsync(clientFingerprint, webSocket);
                             }
                             break;
 
-                        case "send":
-                            if (packet.Envelope != null && !string.IsNullOrEmpty(packet.Envelope.RecipientFingerprint))
+                        case "publish_bundle":
+                            if (packet.Bundle != null)
                             {
-                                var recipient = packet.Envelope.RecipientFingerprint;
-                                if (ConnectedClients.TryGetValue(recipient, out var recipientSocket) && recipientSocket.State == WebSocketState.Open)
+                                if (packet.Bundle.Verify())
                                 {
-                                    // Deliver directly
-                                    var outgoingPacket = new ProtocolPacket
+                                    BundlesByFingerprint[packet.Bundle.Fingerprint] = packet.Bundle;
+                                    if (!string.IsNullOrEmpty(packet.Bundle.Username))
                                     {
-                                        Type = "message",
-                                        Envelope = packet.Envelope
-                                    };
-                                    await SendJsonAsync(recipientSocket, outgoingPacket);
-                                    LogInfo($"Relayed message to online recipient: {recipient[..Math.Min(16, recipient.Length)]}...");
-
-                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "status", Status = "delivered" });
+                                        FingerprintByUsername[packet.Bundle.Username] = packet.Bundle.Fingerprint;
+                                    }
+                                    SaveKeyDirectory();
+                                    LogSuccess($"[KEY-DIR] Published signed PreKey bundle for @{packet.Bundle.Username} ({packet.Bundle.Fingerprint[..8]}...)");
+                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "status", Status = "bundle_published" });
                                 }
                                 else
                                 {
-                                    // Store in dead-drop queue
-                                    EnqueueOfflineMessage(recipient, packet.Envelope);
-                                    LogWarn($"Recipient {recipient[..Math.Min(16, recipient.Length)]}... is offline. Queued in Dead-Drop.");
+                                    LogWarn("[KEY-DIR] Rejected invalid PreKey bundle signature!");
+                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "error", Error = "Invalid bundle signature" });
+                                }
+                            }
+                            break;
 
+                        case "lookup_bundle":
+                            if (!string.IsNullOrEmpty(packet.Query))
+                            {
+                                var query = packet.Query.Trim().TrimStart('@');
+                                PreKeyBundle? foundBundle = null;
+
+                                if (BundlesByFingerprint.TryGetValue(query, out var b1))
+                                {
+                                    foundBundle = b1;
+                                }
+                                else if (FingerprintByUsername.TryGetValue(query, out var fp) && BundlesByFingerprint.TryGetValue(fp, out var b2))
+                                {
+                                    foundBundle = b2;
+                                }
+
+                                if (foundBundle != null)
+                                {
+                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "bundle_result", Bundle = foundBundle });
+                                    LogInfo($"[KEY-DIR] Lookup success for query: {query}");
+                                }
+                                else
+                                {
+                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "error", Error = "User not found in Key Directory" });
+                                    LogWarn($"[KEY-DIR] User not found for query: {query}");
+                                }
+                            }
+                            break;
+
+                        case "ratchet_message":
+                            if (packet.RatchetMessage != null && !string.IsNullOrEmpty(packet.RatchetMessage.RecipientFingerprint))
+                            {
+                                var recipient = packet.RatchetMessage.RecipientFingerprint;
+                                if (ConnectedClients.TryGetValue(recipient, out var recipientSocket) && recipientSocket.State == WebSocketState.Open)
+                                {
+                                    await SendJsonAsync(recipientSocket, packet);
+                                    await SendJsonAsync(webSocket, new ProtocolPacket { Type = "status", Status = "delivered" });
+                                    LogInfo($"Relayed Double Ratchet message to online recipient: {recipient[..8]}...");
+                                }
+                                else
+                                {
+                                    EnqueueOfflineMessage(recipient, packet);
                                     await SendJsonAsync(webSocket, new ProtocolPacket { Type = "status", Status = "queued_offline" });
+                                    LogWarn($"Recipient {recipient[..8]}... is offline. Saved to Dead-Drop.");
                                 }
                             }
                             break;
@@ -196,7 +226,6 @@ namespace Messa.Server
                 if (!string.IsNullOrEmpty(clientFingerprint))
                 {
                     ConnectedClients.TryRemove(clientFingerprint, out _);
-                    LogInfo($"Client unregistered: {clientFingerprint[..Math.Min(16, clientFingerprint.Length)]}...");
                 }
                 webSocket.Dispose();
             }
@@ -205,42 +234,65 @@ namespace Messa.Server
         private static async Task SendJsonAsync(WebSocket socket, ProtocolPacket packet)
         {
             if (socket.State != WebSocketState.Open) return;
-            var json = JsonSerializer.Serialize(packet);
-            var bytes = Encoding.UTF8.GetBytes(json);
+            var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
             await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
-        private static void EnqueueOfflineMessage(string recipientFingerprint, EncryptedEnvelope envelope)
+        private static void EnqueueOfflineMessage(string recipient, ProtocolPacket packet)
         {
-            OfflineQueue.AddOrUpdate(recipientFingerprint,
-                _ => new List<EncryptedEnvelope> { envelope },
-                (_, list) => { lock (list) { list.Add(envelope); } return list; });
-
+            OfflineQueue.AddOrUpdate(recipient,
+                _ => new List<ProtocolPacket> { packet },
+                (_, list) => { lock (list) { list.Add(packet); } return list; });
             SaveOfflineQueue();
         }
 
-        private static async Task DeliverOfflineMessagesAsync(string recipientFingerprint, WebSocket socket)
+        private static async Task DeliverOfflineMessagesAsync(string recipient, WebSocket socket)
         {
-            if (OfflineQueue.TryRemove(recipientFingerprint, out var list))
+            if (OfflineQueue.TryRemove(recipient, out var list))
             {
-                List<EncryptedEnvelope> copy;
-                lock (list)
-                {
-                    copy = new List<EncryptedEnvelope>(list);
-                }
+                List<ProtocolPacket> copy;
+                lock (list) copy = new List<ProtocolPacket>(list);
 
-                LogInfo($"Flushing {copy.Count} offline message(s) for client...");
-                foreach (var env in copy)
+                foreach (var p in copy)
                 {
-                    var packet = new ProtocolPacket
-                    {
-                        Type = "message",
-                        Envelope = env
-                    };
-                    await SendJsonAsync(socket, packet);
+                    await SendJsonAsync(socket, p);
                 }
                 SaveOfflineQueue();
             }
+        }
+
+        private static void LoadKeyDirectory()
+        {
+            if (File.Exists(KeyDirFile))
+            {
+                try
+                {
+                    var data = JsonSerializer.Deserialize<Dictionary<string, PreKeyBundle>>(File.ReadAllText(KeyDirFile));
+                    if (data != null)
+                    {
+                        foreach (var kvp in data)
+                        {
+                            BundlesByFingerprint[kvp.Key] = kvp.Value;
+                            if (!string.IsNullOrEmpty(kvp.Value.Username))
+                            {
+                                FingerprintByUsername[kvp.Value.Username] = kvp.Key;
+                            }
+                        }
+                        LogInfo($"[KEY-DIR] Loaded {BundlesByFingerprint.Count} PreKey bundle(s) from disk.");
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void SaveKeyDirectory()
+        {
+            try
+            {
+                var dict = new Dictionary<string, PreKeyBundle>(BundlesByFingerprint);
+                File.WriteAllText(KeyDirFile, JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch { }
         }
 
         private static void LoadOfflineQueue()
@@ -249,21 +301,11 @@ namespace Messa.Server
             {
                 try
                 {
-                    var json = File.ReadAllText(DeadDropFile);
-                    var data = JsonSerializer.Deserialize<Dictionary<string, List<EncryptedEnvelope>>>(json);
+                    var data = JsonSerializer.Deserialize<Dictionary<string, List<ProtocolPacket>>>(File.ReadAllText(DeadDropFile));
                     if (data != null)
-                    {
-                        foreach (var kvp in data)
-                        {
-                            OfflineQueue[kvp.Key] = kvp.Value;
-                        }
-                        LogInfo($"Loaded {OfflineQueue.Count} queued recipient mailbox(es) from Dead-Drop.");
-                    }
+                        foreach (var kvp in data) OfflineQueue[kvp.Key] = kvp.Value;
                 }
-                catch (Exception ex)
-                {
-                    LogError($"Failed to load Dead-Drop file: {ex.Message}");
-                }
+                catch { }
             }
         }
 
@@ -271,50 +313,22 @@ namespace Messa.Server
         {
             try
             {
-                var dict = new Dictionary<string, List<EncryptedEnvelope>>(OfflineQueue);
-                var json = JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(DeadDropFile, json);
+                var dict = new Dictionary<string, List<ProtocolPacket>>(OfflineQueue);
+                File.WriteAllText(DeadDropFile, JsonSerializer.Serialize(dict, new JsonSerializerOptions { WriteIndented = true }));
             }
-            catch (Exception ex)
-            {
-                LogError($"Failed to save Dead-Drop: {ex.Message}");
-            }
+            catch { }
         }
 
         private static void StartCloudflareTunnel()
         {
-            var cfPaths = new[]
-            {
-                "cloudflared",
-                @"C:\Program Files (x86)\cloudflared\cloudflared.exe",
-                @"C:\Program Files\cloudflared\cloudflared.exe"
-            };
-
-            string? cfExecutable = null;
-            foreach (var p in cfPaths)
-            {
-                if (File.Exists(p) || p == "cloudflared")
-                {
-                    cfExecutable = p;
-                    break;
-                }
-            }
-
-            if (string.IsNullOrEmpty(cfExecutable))
-            {
-                LogWarn("Cloudflare binary (cloudflared) not found. Running in local mode only.");
-                return;
-            }
-
             try
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = cfExecutable,
+                    FileName = @"C:\Program Files (x86)\cloudflared\cloudflared.exe",
                     Arguments = $"tunnel --url http://127.0.0.1:{Port}",
                     UseShellExecute = false,
                     RedirectStandardError = true,
-                    RedirectStandardOutput = true,
                     CreateNoWindow = true
                 };
 
@@ -325,60 +339,26 @@ namespace Messa.Server
                     var match = Regex.Match(e.Data, @"https://[a-zA-Z0-9-]+\.trycloudflare\.com");
                     if (match.Success)
                     {
-                        var httpUrl = match.Value;
-                        var wssUrl = httpUrl.Replace("https://", "wss://");
-                        LogSuccess($"[CLOUDFLARE TUNNEL ONLINE] Relay available globally at: {wssUrl}");
-
-                        try
-                        {
-                            var tunnelJson = JsonSerializer.Serialize(new { url = wssUrl, lanUrl = $"ws://127.0.0.1:{Port}" });
-                            File.WriteAllText(TunnelFile, tunnelJson);
-                        }
-                        catch { }
+                        var wssUrl = match.Value.Replace("https://", "wss://");
+                        LogSuccess($"[CLOUDFLARE TUNNEL ONLINE] Relay: {wssUrl}");
+                        File.WriteAllText(TunnelFile, JsonSerializer.Serialize(new { url = wssUrl, lanUrl = $"ws://127.0.0.1:{Port}" }));
                     }
                 };
-
                 _cloudflaredProcess.Start();
                 _cloudflaredProcess.BeginErrorReadLine();
-                LogInfo("Started Cloudflare trycloudflare quick tunnel.");
             }
-            catch (Exception ex)
-            {
-                LogWarn($"Could not launch Cloudflare tunnel: {ex.Message}");
-            }
+            catch { }
         }
 
         private static void StopCloudflareTunnel()
         {
-            if (_cloudflaredProcess != null && !_cloudflaredProcess.HasExited)
-            {
-                try
-                {
-                    _cloudflaredProcess.Kill(true);
-                    _cloudflaredProcess.Dispose();
-                }
-                catch { }
-            }
+            try { _cloudflaredProcess?.Kill(true); } catch { }
         }
 
-        private static void PrintBanner()
-        {
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine(@"
- ███╗   ███╗███████╗███████╗███████╗ █████╗ 
- ████╗ ████║██╔════╝██╔════╝██╔════╝██╔══██╗
- ██╔████╔██║█████╗  ███████╗███████╗███████║
- ██║╚██╔╝██║██╔══╝  ╚════██║╚════██║██╔══██║
- ██║ ╚═╝ ██║███████╗███████║███████║██║  ██║
- ╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝
- Sovereign P2P/E2EE Native C# Relay Server
-");
-            Console.ResetColor();
-        }
-
-        private static void LogInfo(string msg) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [INFO] {msg}");
-        private static void LogSuccess(string msg) { Console.ForegroundColor = ConsoleColor.Green; Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [OK] {msg}"); Console.ResetColor(); }
-        private static void LogWarn(string msg) { Console.ForegroundColor = ConsoleColor.Yellow; Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [WARN] {msg}"); Console.ResetColor(); }
-        private static void LogError(string msg) { Console.ForegroundColor = ConsoleColor.Red; Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [ERROR] {msg}"); Console.ResetColor(); }
+        private static void PrintBanner() => Console.WriteLine("\n[MESSA] Sovereign Native C# Relay Server (with Key Directory & Double Ratchet)\n");
+        private static void LogInfo(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [INFO] {m}");
+        private static void LogSuccess(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [OK] {m}");
+        private static void LogWarn(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [WARN] {m}");
+        private static void LogError(string m) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [ERROR] {m}");
     }
 }

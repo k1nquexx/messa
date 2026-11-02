@@ -11,11 +11,20 @@ namespace Messa.Core.Models
         [JsonPropertyName("fingerprint")]
         public string? Fingerprint { get; set; }
 
-        [JsonPropertyName("publicKey")]
-        public string? PublicKey { get; set; }
+        [JsonPropertyName("username")]
+        public string? Username { get; set; }
 
-        [JsonPropertyName("envelope")]
-        public EncryptedEnvelope? Envelope { get; set; }
+        [JsonPropertyName("query")]
+        public string? Query { get; set; }
+
+        [JsonPropertyName("bundle")]
+        public PreKeyBundle? Bundle { get; set; }
+
+        [JsonPropertyName("ratchetMessage")]
+        public RatchetMessage? RatchetMessage { get; set; }
+
+        [JsonPropertyName("senderIdDhKey")]
+        public string? SenderIdentityDhKeyBase64 { get; set; }
 
         [JsonPropertyName("error")]
         public string? Error { get; set; }
