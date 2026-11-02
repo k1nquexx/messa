@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  cipher-server:
+    build: .
+    container_name: cipher-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - NODE_ENV=production
+      - DISABLE_TUNNEL=true
+      - CIPHER_SERVER_SECRET=
+    volumes:
+      - ./data:/app/data

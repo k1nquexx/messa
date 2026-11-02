@@ -2,6 +2,9 @@
   "appId": "com.cipher.messenger",
   "appName": "CIPHER",
   "webDir": "public",
+  "android": {
+    "path": "mobile/android"
+  },
   "server": {
     "androidScheme": "http",
     "cleartext": true

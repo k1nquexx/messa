@@ -156,6 +156,12 @@
                 </div>
 
                 <div class="chat-header-actions">
+                    <button id="btn-search-in-chat" class="icon-circle-btn" title="Поиск по сообщениям">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                        </svg>
+                    </button>
                     <button id="btn-audio-call" class="icon-circle-btn" title="Защищенный E2EE аудиозвонок (WebRTC)">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
@@ -181,6 +187,33 @@
                     </button>
                 </div>
             </header>
+
+            <!-- Панель поиска сообщений в чате (Telegram style) -->
+            <div class="inchat-search-bar" id="inchat-search-bar" style="display: none;">
+                <div class="inchat-search-input-wrap">
+                    <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    <input type="text" id="input-inchat-search" placeholder="Поиск в этом чате..." autocomplete="off">
+                </div>
+                <div class="inchat-search-nav">
+                    <span class="inchat-search-count" id="inchat-search-count">0 совпадений</span>
+                    <button type="button" class="icon-circle-btn sm" id="btn-inchat-prev" title="Предыдущее совпадение">▲</button>
+                    <button type="button" class="icon-circle-btn sm" id="btn-inchat-next" title="Следующее совпадение">▼</button>
+                    <button type="button" class="icon-circle-btn sm" id="btn-inchat-close" title="Закрыть поиск">✕</button>
+                </div>
+            </div>
+
+            <!-- Закрепленное сообщение вверху чата (Telegram style) -->
+            <div class="pinned-message-bar" id="pinned-message-bar" style="display: none;">
+                <div class="pinned-icon">📌</div>
+                <div class="pinned-content" id="pinned-content" title="Перейти к сообщению">
+                    <div class="pinned-title">Закрепленное сообщение</div>
+                    <div class="pinned-snippet" id="pinned-snippet">Текст сообщения...</div>
+                </div>
+                <button type="button" class="pinned-close-btn" id="btn-unpin-message" title="Открепить сообщение">✕</button>
+            </div>
 
             <!-- Лента сообщений -->
             <div class="chat-messages" id="messages-container">
@@ -208,6 +241,9 @@
                     <p class="empty-hint">Выберите чат слева или нажмите <strong>«+ Добавить контакт»</strong></p>
                 </div>
             </div>
+
+            <!-- Индикатор набора текста собеседником -->
+            <div class="typing-indicator-row" id="chat-typing-row" style="display: none;"></div>
 
             <!-- Панель редактирования сообщения (Edit) -->
             <div class="edit-preview-bar" id="edit-preview-bar" style="display: none;">
@@ -266,6 +302,14 @@
                     </button>
                 </div>
             </div>
+
+            <!-- Плавающая кнопка быстрого скролла вниз с бейджем непрочитанных (Telegram style) -->
+            <button type="button" class="floating-scroll-bottom-btn" id="btn-scroll-bottom" title="Вниз к новым сообщениям" style="display: none;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+                <span class="scroll-unread-badge" id="scroll-unread-badge" style="display: none;">0</span>
+            </button>
 
             <!-- Панель ввода сообщения -->
             <footer class="chat-input-bar" id="chat-input-area" style="display: none;">
@@ -434,7 +478,10 @@
                 </div>
             </div>
             <div class="modal-actions space-between">
-                <button class="btn-modal-danger" id="btn-delete-contact">🗑️ Удалить чат</button>
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn-modal-danger" id="btn-delete-contact" title="Удалить контакт и всю переписку">🗑️ Удалить</button>
+                    <button class="btn-modal-cancel" id="btn-clear-chat-history" title="Удалить сообщения, оставив контакт">🧹 Очистить</button>
+                </div>
                 <button class="btn-modal-save" id="btn-save-contact-info">Сохранить</button>
             </div>
         </div>
@@ -627,6 +674,29 @@
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-modal-cancel" id="btn-cancel-qr-scan" style="width: 100%;">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно: Переслать сообщение (Telegram style) -->
+    <div class="modal-backdrop" id="modal-forward-message" style="display: none; z-index: 10001;">
+        <div class="modal-dialog" style="max-width: 400px;">
+            <div class="modal-head">
+                <div class="modal-title-row">
+                    <span class="modal-icon">➡️</span>
+                    <h3>Переслать сообщение</h3>
+                </div>
+                <button class="modal-close-btn" id="btn-close-forward">&times;</button>
+            </div>
+            <div class="modal-content">
+                <div class="forward-preview-box" id="forward-preview-snippet">...</div>
+                <p class="modal-explanation" style="margin: 12px 0 8px 0;">Выберите чат для отправки:</p>
+                <div class="forward-contact-list" id="forward-contact-list">
+                    <!-- Заполняется динамически -->
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn-modal-cancel" id="btn-cancel-forward" style="width: 100%;">Отмена</button>
             </div>
         </div>
     </div>

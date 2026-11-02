@@ -454,6 +454,16 @@ namespace CipherNative
 
         private static MediaPlayer activePlayer = null;
         private static string currentPlayingTempFile = null;
+        public static double CurrentPlaybackSpeed = 1.0;
+
+        public static void SetPlaybackSpeed(double speed)
+        {
+            CurrentPlaybackSpeed = speed;
+            if (activePlayer != null)
+            {
+                try { activePlayer.SpeedRatio = speed; } catch { }
+            }
+        }
 
         // Универсальное воспроизведение любого аудио (WAV, WebM, Ogg, MP3) через системный MediaFoundation
         public static void PlayAudioBytes(byte[] audioBytes, string extensionHint)
@@ -487,6 +497,7 @@ namespace CipherNative
                             currentPlayingTempFile = tempFile;
                             activePlayer = new MediaPlayer();
                             activePlayer.Open(new Uri(tempFile));
+                            try { activePlayer.SpeedRatio = CurrentPlaybackSpeed; } catch { }
                             activePlayer.MediaEnded += delegate
                             {
                                 if (activePlayer != null)
@@ -669,6 +680,8 @@ namespace CipherNative
         public string ReplyToId { get; set; }
         public string ReplyPreviewText { get; set; }
         public string ReplySenderName { get; set; }
+        public Dictionary<string, List<string>> Reactions { get; set; }
+        public string ForwardedFrom { get; set; }
     }
 
     // =========================================================================
@@ -743,6 +756,21 @@ namespace CipherNative
         private Border editPreviewBar;
         private TextBlock txtEditContent;
 
+        // Telegram функции (Реакции, Закрепленные сообщения, Поиск в чате, Черновики, Пересылка)
+        private Dictionary<string, string> pinnedMessages = new Dictionary<string, string>();
+        private Dictionary<string, string> chatDrafts = new Dictionary<string, string>();
+        private HashSet<string> typingContacts = new HashSet<string>();
+        private DispatcherTimer typingTimer = null;
+        private Border pinnedBanner = null;
+        private TextBlock txtPinnedSnippet = null;
+        private Border inChatSearchBar = null;
+        private TextBox txtInChatQuery = null;
+        private TextBlock txtInChatCount = null;
+        private List<string> inChatSearchResults = new List<string>();
+        private int inChatSearchIndex = -1;
+        private double currentAudioSpeed = 1.0;
+        private long lastTypingSentMs = 0;
+
         // In-App уведомления и модальные окна (ВМЕСТО УРОДЛИВЫХ MESSAGEBOX)
         private Border toastCard;
         private TextBlock toastIconTxt;
@@ -774,6 +802,7 @@ namespace CipherNative
             }
 
             BuildTelegramInterface();
+            LoadPinnedMessages();
 
             LoadContacts();
             SetupMutualPairing();
@@ -1208,6 +1237,28 @@ namespace CipherNative
                 BorderBrush = BrushBorderSubtle
             };
             panel.Children.Add(tKey);
+
+            var btnClear = CreateTgButton("🧹 Очистить историю сообщений", Color.FromRgb(51, 65, 85), Color.FromRgb(71, 85, 105), delegate
+            {
+                ShowConfirmDialog("Очистить историю?", "Все сообщения в переписке с " + activeContact.Name + " будут удалены.", "Очистить", delegate
+                {
+                    string cId = activeContact.Id;
+                    if (messages.ContainsKey(cId)) messages[cId].Clear();
+                    if (pinnedMessages.ContainsKey(cId)) pinnedMessages.Remove(cId);
+                    if (chatDrafts.ContainsKey(cId)) chatDrafts.Remove(cId);
+                    SaveMessages();
+                    SavePinnedMessages();
+                    panelMessages.Children.Clear();
+                    emptyChatPlaceholder.Visibility = Visibility.Visible;
+                    if (pinnedBanner != null) pinnedBanner.Visibility = Visibility.Collapsed;
+                    RenderContactList();
+                    HideModal();
+                    ShowToast("История чата очищена", ToastType.Info);
+                }, false);
+            });
+            btnClear.Height = 36;
+            btnClear.Margin = new Thickness(0, 0, 0, 10);
+            panel.Children.Add(btnClear);
 
             var btnDel = CreateTgButton("🗑 Удалить чат и историю", Color.FromRgb(225, 29, 72), Color.FromRgb(244, 63, 94), delegate
             {
@@ -2248,6 +2299,14 @@ window.onload = function() {
             });
             btnInfo.Margin = new Thickness(10, 0, 0, 0);
 
+            var btnSearch = CreateTgIconButton("🔍", 14, Color.FromArgb(20, 255, 255, 255), Color.FromArgb(40, 255, 255, 255), delegate
+            {
+                ToggleInChatSearch();
+            });
+            btnSearch.Margin = new Thickness(10, 0, 0, 0);
+            btnSearch.ToolTip = "Поиск по сообщениям в чате";
+
+            headerControlsRight.Children.Add(btnSearch);
             headerControlsRight.Children.Add(destructPill);
             headerControlsRight.Children.Add(btnInfo);
 
@@ -2259,6 +2318,96 @@ window.onload = function() {
 
             // 2.1 Лента сообщений
             var messagesLayerGrid = new Grid();
+            messagesLayerGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 0: Поиск в чате
+            messagesLayerGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // 1: Закрепленное сообщение
+            messagesLayerGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // 2: Сообщения
+
+            // 2.0.1 Панель поиска в чате
+            inChatSearchBar = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(245, 21, 31, 46)),
+                BorderBrush = BrushBorderSubtle,
+                BorderThickness = new Thickness(0, 0, 0, 1),
+                Padding = new Thickness(16, 6, 16, 6),
+                Visibility = Visibility.Collapsed
+            };
+            var searchDock = new DockPanel();
+            var btnSearchClose = CreateTgIconButton("✕", 11, Colors.Transparent, Color.FromArgb(40, 255, 255, 255), delegate
+            {
+                CloseInChatSearch();
+            });
+            btnSearchClose.HorizontalAlignment = HorizontalAlignment.Right;
+            btnSearchClose.VerticalAlignment = VerticalAlignment.Center;
+
+            var navStack = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
+            txtInChatCount = new TextBlock { Text = "0 совпадений", Foreground = BrushTextMuted, FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
+            var btnPrev = CreateTgIconButton("▲", 10, Color.FromArgb(30, 255, 255, 255), Color.FromArgb(60, 255, 255, 255), delegate { NavigateInChatSearch(-1); });
+            btnPrev.Margin = new Thickness(0, 0, 4, 0);
+            var btnNext = CreateTgIconButton("▼", 10, Color.FromArgb(30, 255, 255, 255), Color.FromArgb(60, 255, 255, 255), delegate { NavigateInChatSearch(1); });
+            navStack.Children.Add(txtInChatCount);
+            navStack.Children.Add(btnPrev);
+            navStack.Children.Add(btnNext);
+
+            txtInChatQuery = new TextBox
+            {
+                Background = BrushInputBox,
+                Foreground = Brushes.White,
+                BorderThickness = new Thickness(1),
+                BorderBrush = BrushBorderSubtle,
+                Padding = new Thickness(8, 4, 8, 4),
+                FontSize = 12
+            };
+            txtInChatQuery.TextChanged += delegate { PerformInChatSearch(txtInChatQuery.Text); };
+            txtInChatQuery.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.Key == Key.Enter) NavigateInChatSearch((Keyboard.Modifiers & ModifierKeys.Shift) != 0 ? -1 : 1);
+                else if (e.Key == Key.Escape) CloseInChatSearch();
+            };
+
+            searchDock.Children.Add(btnSearchClose);
+            searchDock.Children.Add(navStack);
+            searchDock.Children.Add(txtInChatQuery);
+            inChatSearchBar.Child = searchDock;
+            Grid.SetRow(inChatSearchBar, 0);
+
+            // 2.0.2 Панель закрепленного сообщения
+            pinnedBanner = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(240, 26, 38, 57)),
+                BorderBrush = BrushBorderSubtle,
+                BorderThickness = new Thickness(0, 0, 0, 1),
+                Padding = new Thickness(16, 6, 16, 6),
+                Visibility = Visibility.Collapsed,
+                Cursor = Cursors.Hand
+            };
+            var pinnedDock = new DockPanel();
+            var pinIcon = new TextBlock { Text = "📌", FontSize = 13, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
+            var btnUnpin = CreateTgIconButton("✕", 11, Colors.Transparent, Color.FromArgb(40, 255, 255, 255), delegate
+            {
+                if (activeContact != null) UnpinMessage(activeContact.Id);
+            });
+            btnUnpin.HorizontalAlignment = HorizontalAlignment.Right;
+            btnUnpin.VerticalAlignment = VerticalAlignment.Center;
+
+            var pinTextStack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            var pinTitle = new TextBlock { Text = "Закрепленное сообщение", Foreground = BrushAccentTg, FontSize = 10.5, FontWeight = FontWeights.Bold };
+            txtPinnedSnippet = new TextBlock { Text = "...", Foreground = Brushes.White, FontSize = 11.5, TextTrimming = TextTrimming.CharacterEllipsis };
+            pinTextStack.Children.Add(pinTitle);
+            pinTextStack.Children.Add(txtPinnedSnippet);
+
+            pinnedDock.Children.Add(pinIcon);
+            pinnedDock.Children.Add(btnUnpin);
+            pinnedDock.Children.Add(pinTextStack);
+            pinnedBanner.Child = pinnedDock;
+            pinnedBanner.MouseDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                if (e.OriginalSource != btnUnpin && activeContact != null && pinnedMessages.ContainsKey(activeContact.Id))
+                {
+                    ScrollToAndHighlightMessage(pinnedMessages[activeContact.Id]);
+                }
+            };
+            Grid.SetRow(pinnedBanner, 1);
+
             scrollMessages = new ScrollViewer
             {
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
@@ -2340,6 +2489,11 @@ window.onload = function() {
             emptyStack.Children.Add(emptySubtitle);
             emptyChatPlaceholder.Child = emptyStack;
 
+            Grid.SetRow(scrollMessages, 2);
+            Grid.SetRow(emptyChatPlaceholder, 2);
+
+            messagesLayerGrid.Children.Add(inChatSearchBar);
+            messagesLayerGrid.Children.Add(pinnedBanner);
             messagesLayerGrid.Children.Add(scrollMessages);
             messagesLayerGrid.Children.Add(emptyChatPlaceholder);
             Grid.SetRow(messagesLayerGrid, 1);
@@ -2576,6 +2730,12 @@ window.onload = function() {
             txtInput.TextChanged += delegate
             {
                 txtInputPlaceholder.Visibility = string.IsNullOrEmpty(txtInput.Text) ? Visibility.Visible : Visibility.Collapsed;
+                NotifyTyping();
+                if (activeContact != null)
+                {
+                    if (!string.IsNullOrEmpty(txtInput.Text)) chatDrafts[activeContact.Id] = txtInput.Text;
+                    else chatDrafts.Remove(activeContact.Id);
+                }
             };
             txtInput.PreviewKeyDown += delegate(object s, KeyEventArgs e)
             {
@@ -2924,6 +3084,19 @@ window.onload = function() {
                     return;
                 }
 
+                if (action == "typing")
+                {
+                    string fromId = packet.ContainsKey("from") && packet["from"] != null ? packet["from"].ToString() : "";
+                    if (!string.IsNullOrEmpty(fromId))
+                    {
+                        Dispatcher.Invoke(new Action(delegate
+                        {
+                            HandleIncomingTyping(fromId);
+                        }));
+                    }
+                    return;
+                }
+
                 if (action == "incoming_envelope")
                 {
                     var env = packet["envelope"] as Dictionary<string, object>;
@@ -3035,6 +3208,65 @@ window.onload = function() {
                                     RenderContactList();
                                 }));
                             }
+                            return;
+                        }
+
+                        if (pType == "reaction")
+                        {
+                            string targetId = payload.ContainsKey("targetMessageId") && payload["targetMessageId"] != null ? payload["targetMessageId"].ToString() : null;
+                            string emoji = payload.ContainsKey("emoji") && payload["emoji"] != null ? payload["emoji"].ToString() : null;
+                            if (!string.IsNullOrEmpty(targetId) && !string.IsNullOrEmpty(emoji))
+                            {
+                                Dispatcher.Invoke(new Action(delegate
+                                {
+                                    if (messages.ContainsKey(chatKey))
+                                    {
+                                        var m = messages[chatKey].Find(delegate(MessageModel mm) { return mm.Id == targetId; });
+                                        if (m != null)
+                                        {
+                                            if (m.Reactions == null) m.Reactions = new Dictionary<string, List<string>>();
+                                            if (!m.Reactions.ContainsKey(emoji)) m.Reactions[emoji] = new List<string>();
+                                            if (m.Reactions[emoji].Contains(senderId))
+                                            {
+                                                m.Reactions[emoji].Remove(senderId);
+                                                if (m.Reactions[emoji].Count == 0) m.Reactions.Remove(emoji);
+                                            }
+                                            else
+                                            {
+                                                m.Reactions[emoji].Add(senderId);
+                                            }
+                                            SaveMessages();
+                                        }
+                                    }
+                                    if (activeContact != null && activeContact.Id == chatKey)
+                                    {
+                                        RefreshBubbleReactions(targetId);
+                                    }
+                                }));
+                            }
+                            return;
+                        }
+
+                        if (pType == "pin_message")
+                        {
+                            bool unpin = payload.ContainsKey("unpin") && payload["unpin"] != null && Convert.ToBoolean(payload["unpin"]);
+                            string targetId = payload.ContainsKey("targetMessageId") && payload["targetMessageId"] != null ? payload["targetMessageId"].ToString() : null;
+                            Dispatcher.Invoke(new Action(delegate
+                            {
+                                if (unpin)
+                                {
+                                    pinnedMessages.Remove(chatKey);
+                                }
+                                else if (!string.IsNullOrEmpty(targetId))
+                                {
+                                    pinnedMessages[chatKey] = targetId;
+                                }
+                                SavePinnedMessages();
+                                if (activeContact != null && activeContact.Id == chatKey)
+                                {
+                                    UpdatePinnedBanner(chatKey);
+                                }
+                            }));
                             return;
                         }
 
@@ -3206,7 +3438,8 @@ window.onload = function() {
                                 IsRead = isCurrentChat,
                                 ReplyToId = rId,
                                 ReplyPreviewText = rText,
-                                ReplySenderName = rName
+                                ReplySenderName = rName,
+                                ForwardedFrom = payload.ContainsKey("forwardedFrom") && payload["forwardedFrom"] != null ? payload["forwardedFrom"].ToString() : null
                             };
 
                             messages[chatKey].Add(newMsg);
@@ -3520,6 +3753,7 @@ window.onload = function() {
             activeContact.LastTime = DateTime.Now.ToString("HH:mm");
 
             txtInput.Text = "";
+            chatDrafts.Remove(activeContact.Id);
             ClearAttachedPhoto();
             ClearReply();
 
@@ -3663,6 +3897,20 @@ window.onload = function() {
             };
 
             var bubbleStack = new StackPanel();
+
+            // Пересланное сообщение (Telegram style)
+            if (!string.IsNullOrEmpty(msg.ForwardedFrom))
+            {
+                var fwdTxt = new TextBlock
+                {
+                    Text = "Переслано от " + msg.ForwardedFrom,
+                    FontStyle = FontStyles.Italic,
+                    Foreground = new SolidColorBrush(Color.FromRgb(165, 180, 252)),
+                    FontSize = 10.5,
+                    Margin = new Thickness(0, 0, 0, 4)
+                };
+                bubbleStack.Children.Add(fwdTxt);
+            }
 
             // Если это групповой чат и сообщение от другого участника — выводим его имя сверху
             if (!msg.FromMe && !string.IsNullOrEmpty(msg.SenderName) && activeContact != null && activeContact.IsGroup)
@@ -3883,13 +4131,36 @@ window.onload = function() {
 
                 var durText = new TextBlock
                 {
-                    Text = "🎤 Голосовое сообщение (" + msg.VoiceDuration + " сек)",
+                    Text = "🎤 (" + msg.VoiceDuration + " сек)",
                     Foreground = Brushes.White,
                     FontSize = 12,
                     VerticalAlignment = VerticalAlignment.Center,
                     Margin = new Thickness(10, 0, 0, 0)
                 };
+
+                var btnSpeed = new Border
+                {
+                    Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
+                    CornerRadius = new CornerRadius(4),
+                    Padding = new Thickness(6, 2, 6, 2),
+                    Margin = new Thickness(8, 0, 0, 0),
+                    Cursor = Cursors.Hand,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    ToolTip = "Скорость воспроизведения"
+                };
+                var txtSpeed = new TextBlock { Text = currentAudioSpeed.ToString("0.#") + "x", Foreground = Brushes.White, FontSize = 10.5, FontWeight = FontWeights.Bold };
+                btnSpeed.Child = txtSpeed;
+                btnSpeed.MouseDown += delegate
+                {
+                    if (currentAudioSpeed == 1.0) currentAudioSpeed = 1.5;
+                    else if (currentAudioSpeed == 1.5) currentAudioSpeed = 2.0;
+                    else currentAudioSpeed = 1.0;
+                    txtSpeed.Text = currentAudioSpeed.ToString("0.#") + "x";
+                    NativeAudio.SetPlaybackSpeed(currentAudioSpeed);
+                };
+
                 voiceDock.Children.Add(btnPlay);
+                voiceDock.Children.Add(btnSpeed);
                 voiceDock.Children.Add(durText);
                 voicePanel.Child = voiceDock;
                 bubbleStack.Children.Add(voicePanel);
@@ -3949,13 +4220,40 @@ window.onload = function() {
             bubbleStack.Children.Add(btnCipher);
             bubbleStack.Children.Add(boxCipher);
 
+            UpdateReactionsWrap(bubbleStack, msg);
+
             bubble.Child = bubbleStack;
 
             // Контекстное меню пузыря
             var cm = new ContextMenu();
+
+            var miReactions = new MenuItem { Header = "❤️ Реакции" };
+            string[] emList = new string[] { "👍", "❤️", "🔥", "👏", "😂", "😮" };
+            foreach (var em in emList)
+            {
+                string curEm = em;
+                var miEm = new MenuItem { Header = curEm };
+                miEm.Click += delegate { ToggleReaction(msg, curEm); };
+                miReactions.Items.Add(miEm);
+            }
+            cm.Items.Add(miReactions);
+
             var miReply = new MenuItem { Header = "↩ Ответить" };
             miReply.Click += delegate { StartReply(msg); };
             cm.Items.Add(miReply);
+
+            bool isCurPinned = activeContact != null && pinnedMessages.ContainsKey(activeContact.Id) && pinnedMessages[activeContact.Id] == msg.Id;
+            var miPin = new MenuItem { Header = isCurPinned ? "📌 Открепить" : "📌 Закрепить" };
+            miPin.Click += delegate
+            {
+                if (isCurPinned) UnpinMessage(activeContact.Id);
+                else PinMessage(msg);
+            };
+            cm.Items.Add(miPin);
+
+            var miForward = new MenuItem { Header = "➡️ Переслать" };
+            miForward.Click += delegate { ShowForwardDialog(msg); };
+            cm.Items.Add(miForward);
 
             if (!string.IsNullOrEmpty(msg.Text))
             {
@@ -4200,6 +4498,518 @@ window.onload = function() {
                     break;
                 }
             }
+        }
+
+        // =====================================================================
+        // РЕАКЦИИ, ЗАКРЕПЫ, ПОИСК В ЧАТЕ И ПЕРЕСЫЛКА (TELEGRAM STYLE)
+        // =====================================================================
+        private void UpdateReactionsWrap(StackPanel bubbleStack, MessageModel msg)
+        {
+            if (bubbleStack == null || msg == null) return;
+            UIElement existingWrap = null;
+            foreach (UIElement el in bubbleStack.Children)
+            {
+                var fe = el as FrameworkElement;
+                if (fe != null && (string)fe.Tag == "reactions_wrap")
+                {
+                    existingWrap = el;
+                    break;
+                }
+            }
+            if (existingWrap != null) bubbleStack.Children.Remove(existingWrap);
+
+            if (msg.Reactions != null && msg.Reactions.Count > 0)
+            {
+                var wrap = new WrapPanel { Tag = "reactions_wrap", Margin = new Thickness(0, 5, 0, 0) };
+                foreach (var kvp in msg.Reactions)
+                {
+                    string emoji = kvp.Key;
+                    var users = kvp.Value;
+                    if (users == null || users.Count == 0) continue;
+                    bool isMy = users.Contains(identity.Id);
+                    var chip = new Border
+                    {
+                        Background = isMy ? new SolidColorBrush(Color.FromArgb(90, 79, 164, 228)) : new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
+                        BorderBrush = isMy ? new SolidColorBrush(Color.FromRgb(79, 164, 228)) : null,
+                        BorderThickness = isMy ? new Thickness(1) : new Thickness(0),
+                        CornerRadius = new CornerRadius(10),
+                        Padding = new Thickness(6, 2, 8, 2),
+                        Margin = new Thickness(0, 0, 4, 4),
+                        Cursor = Cursors.Hand
+                    };
+                    var chipStack = new StackPanel { Orientation = Orientation.Horizontal };
+                    chipStack.Children.Add(new TextBlock { Text = emoji, FontSize = 12 });
+                    chipStack.Children.Add(new TextBlock { Text = " " + users.Count, FontSize = 10.5, Foreground = Brushes.White, Margin = new Thickness(3, 0, 0, 0) });
+                    chip.Child = chipStack;
+                    string curEm = emoji;
+                    chip.MouseDown += delegate { ToggleReaction(msg, curEm); };
+                    wrap.Children.Add(chip);
+                }
+                bubbleStack.Children.Add(wrap);
+            }
+        }
+
+        private void RefreshBubbleReactions(string msgId)
+        {
+            if (activeContact == null || !messages.ContainsKey(activeContact.Id)) return;
+            var msg = messages[activeContact.Id].Find(delegate(MessageModel mm) { return mm.Id == msgId; });
+            if (msg == null) return;
+            foreach (UIElement child in panelMessages.Children)
+            {
+                var grid = child as Grid;
+                if (grid != null && (string)grid.Tag == msgId)
+                {
+                    if (grid.Children.Count > 0)
+                    {
+                        var bubble = grid.Children[0] as Border;
+                        if (bubble != null)
+                        {
+                            var stack = bubble.Child as StackPanel;
+                            if (stack != null)
+                            {
+                                UpdateReactionsWrap(stack, msg);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        private async void ToggleReaction(MessageModel msg, string emoji)
+        {
+            if (activeContact == null || msg == null) return;
+            if (msg.Reactions == null) msg.Reactions = new Dictionary<string, List<string>>();
+            if (!msg.Reactions.ContainsKey(emoji)) msg.Reactions[emoji] = new List<string>();
+
+            if (msg.Reactions[emoji].Contains(identity.Id))
+            {
+                msg.Reactions[emoji].Remove(identity.Id);
+                if (msg.Reactions[emoji].Count == 0) msg.Reactions.Remove(emoji);
+            }
+            else
+            {
+                msg.Reactions[emoji].Add(identity.Id);
+            }
+            SaveMessages();
+            RefreshBubbleReactions(msg.Id);
+
+            var reactionPayload = new Dictionary<string, object>
+            {
+                { "type", "reaction" },
+                { "targetMessageId", msg.Id },
+                { "emoji", emoji },
+                { "senderId", identity.Id },
+                { "senderPublicKeyB64", identity.PublicKeyB64 },
+                { "timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+            };
+
+            if (activeContact.IsGroup)
+            {
+                reactionPayload["groupId"] = activeContact.Id;
+                await FanOutEnvelopeAsync(activeContact, reactionPayload);
+            }
+            else
+            {
+                await SendEnvelopeToContactAsync(activeContact, reactionPayload);
+            }
+        }
+
+        private async void PinMessage(MessageModel msg)
+        {
+            if (activeContact == null || msg == null) return;
+            pinnedMessages[activeContact.Id] = msg.Id;
+            SavePinnedMessages();
+            UpdatePinnedBanner(activeContact.Id);
+
+            var pinPayload = new Dictionary<string, object>
+            {
+                { "type", "pin_message" },
+                { "targetMessageId", msg.Id },
+                { "senderId", identity.Id },
+                { "timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+            };
+            if (activeContact.IsGroup)
+            {
+                pinPayload["groupId"] = activeContact.Id;
+                await FanOutEnvelopeAsync(activeContact, pinPayload);
+            }
+            else
+            {
+                await SendEnvelopeToContactAsync(activeContact, pinPayload);
+            }
+            ShowToast("Сообщение закреплено", ToastType.Success);
+        }
+
+        private async void UnpinMessage(string contactId)
+        {
+            if (string.IsNullOrEmpty(contactId)) return;
+            pinnedMessages.Remove(contactId);
+            SavePinnedMessages();
+            UpdatePinnedBanner(contactId);
+
+            var unpinPayload = new Dictionary<string, object>
+            {
+                { "type", "pin_message" },
+                { "unpin", true },
+                { "senderId", identity.Id },
+                { "timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+            };
+            var contact = contacts.Find(delegate(ContactModel c) { return c.Id == contactId; });
+            if (contact != null)
+            {
+                if (contact.IsGroup)
+                {
+                    unpinPayload["groupId"] = contact.Id;
+                    await FanOutEnvelopeAsync(contact, unpinPayload);
+                }
+                else
+                {
+                    await SendEnvelopeToContactAsync(contact, unpinPayload);
+                }
+            }
+            ShowToast("Сообщение откреплено", ToastType.Info);
+        }
+
+        private void UpdatePinnedBanner(string contactId)
+        {
+            if (pinnedBanner == null || txtPinnedSnippet == null) return;
+            if (string.IsNullOrEmpty(contactId) || !pinnedMessages.ContainsKey(contactId) || !messages.ContainsKey(contactId))
+            {
+                pinnedBanner.Visibility = Visibility.Collapsed;
+                return;
+            }
+            string pinnedId = pinnedMessages[contactId];
+            var msg = messages[contactId].Find(delegate(MessageModel m) { return m.Id == pinnedId; });
+            if (msg == null)
+            {
+                pinnedBanner.Visibility = Visibility.Collapsed;
+                return;
+            }
+            txtPinnedSnippet.Text = GetMessageSummary(msg);
+            pinnedBanner.Visibility = Visibility.Visible;
+        }
+
+        private void SavePinnedMessages()
+        {
+            try
+            {
+                string appData = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CipherNative");
+                string pinFile = System.IO.Path.Combine(appData, "pinned_" + this.userName + ".json");
+                File.WriteAllText(pinFile, json.Serialize(pinnedMessages), Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        private void LoadPinnedMessages()
+        {
+            try
+            {
+                string appData = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CipherNative");
+                string pinFile = System.IO.Path.Combine(appData, "pinned_" + this.userName + ".json");
+                if (File.Exists(pinFile))
+                {
+                    var loaded = json.Deserialize<Dictionary<string, string>>(File.ReadAllText(pinFile, Encoding.UTF8));
+                    if (loaded != null) pinnedMessages = loaded;
+                }
+            }
+            catch { }
+        }
+
+        private void ToggleInChatSearch()
+        {
+            if (inChatSearchBar == null) return;
+            if (inChatSearchBar.Visibility == Visibility.Visible)
+            {
+                CloseInChatSearch();
+            }
+            else
+            {
+                inChatSearchBar.Visibility = Visibility.Visible;
+                if (txtInChatQuery != null)
+                {
+                    txtInChatQuery.Text = "";
+                    txtInChatQuery.Focus();
+                }
+                PerformInChatSearch("");
+            }
+        }
+
+        private void CloseInChatSearch()
+        {
+            if (inChatSearchBar != null) inChatSearchBar.Visibility = Visibility.Collapsed;
+            inChatSearchResults.Clear();
+            inChatSearchIndex = -1;
+        }
+
+        private void PerformInChatSearch(string query)
+        {
+            inChatSearchResults.Clear();
+            inChatSearchIndex = -1;
+            string q = (query ?? "").Trim().ToLower();
+            if (string.IsNullOrEmpty(q) || activeContact == null || !messages.ContainsKey(activeContact.Id))
+            {
+                if (txtInChatCount != null) txtInChatCount.Text = "0 совпадений";
+                return;
+            }
+
+            foreach (var m in messages[activeContact.Id])
+            {
+                if (!string.IsNullOrEmpty(m.Text) && m.Text.ToLower().Contains(q))
+                {
+                    inChatSearchResults.Add(m.Id);
+                }
+            }
+
+            if (txtInChatCount != null)
+            {
+                txtInChatCount.Text = inChatSearchResults.Count + " совпадений";
+            }
+
+            if (inChatSearchResults.Count > 0)
+            {
+                NavigateInChatSearch(0);
+            }
+        }
+
+        private void NavigateInChatSearch(int direction)
+        {
+            if (inChatSearchResults.Count == 0) return;
+            if (direction == 0)
+            {
+                inChatSearchIndex = 0;
+            }
+            else
+            {
+                inChatSearchIndex = (inChatSearchIndex + direction + inChatSearchResults.Count) % inChatSearchResults.Count;
+            }
+
+            if (txtInChatCount != null)
+            {
+                txtInChatCount.Text = (inChatSearchIndex + 1) + " из " + inChatSearchResults.Count;
+            }
+
+            string targetId = inChatSearchResults[inChatSearchIndex];
+            ScrollToAndHighlightMessage(targetId);
+        }
+
+        private void ShowForwardDialog(MessageModel msg)
+        {
+            if (msg == null || contacts == null || contacts.Count == 0) return;
+
+            var panel = new StackPanel { Width = 380, Margin = new Thickness(20) };
+            var headerRow = new DockPanel { Margin = new Thickness(0, 0, 0, 14) };
+            headerRow.Children.Add(new TextBlock { Text = "Переслать сообщение", Foreground = Brushes.White, FontSize = 15, FontWeight = FontWeights.Bold });
+            var btnClose = CreateTgIconButton("✕", 12, Colors.Transparent, Color.FromArgb(40, 255, 255, 255), delegate { HideModal(); });
+            btnClose.HorizontalAlignment = HorizontalAlignment.Right;
+            headerRow.Children.Add(btnClose);
+            panel.Children.Add(headerRow);
+
+            var previewBox = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(40, 0, 0, 0)),
+                BorderBrush = BrushBorderSubtle,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(10, 8, 10, 8),
+                Margin = new Thickness(0, 0, 0, 14)
+            };
+            string summary = GetMessageSummary(msg);
+            previewBox.Child = new TextBlock { Text = summary, Foreground = new SolidColorBrush(Color.FromRgb(203, 213, 225)), FontSize = 12, TextTrimming = TextTrimming.CharacterEllipsis };
+            panel.Children.Add(previewBox);
+
+            panel.Children.Add(new TextBlock { Text = "Выберите чат:", Foreground = BrushTextMuted, FontSize = 12, Margin = new Thickness(0, 0, 0, 8) });
+
+            var contactScroll = new ScrollViewer { MaxHeight = 240, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+            var contactStack = new StackPanel();
+            foreach (var c in contacts)
+            {
+                var item = new Border
+                {
+                    Background = new SolidColorBrush(Color.FromArgb(20, 255, 255, 255)),
+                    CornerRadius = new CornerRadius(8),
+                    Padding = new Thickness(10, 8, 10, 8),
+                    Margin = new Thickness(0, 0, 0, 6),
+                    Cursor = Cursors.Hand
+                };
+                var itemDock = new DockPanel();
+                var av = CreateAvatarCircle(c.Name, c.Id, 28);
+                var nameTxt = new TextBlock { Text = c.Name, Foreground = Brushes.White, FontWeight = FontWeights.SemiBold, FontSize = 13, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10, 0, 0, 0) };
+                itemDock.Children.Add(av);
+                itemDock.Children.Add(nameTxt);
+                item.Child = itemDock;
+
+                var targetContact = c;
+                item.MouseDown += delegate
+                {
+                    HideModal();
+                    ForwardMessageToContact(msg, targetContact);
+                };
+                contactStack.Children.Add(item);
+            }
+            contactScroll.Content = contactStack;
+            panel.Children.Add(contactScroll);
+
+            ShowModal(panel);
+        }
+
+        private async void ForwardMessageToContact(MessageModel origMsg, ContactModel targetContact)
+        {
+            if (origMsg == null || targetContact == null || webSocket == null || webSocket.State != WebSocketState.Open) return;
+
+            string senderName = origMsg.FromMe ? "Вы" : (activeContact != null ? activeContact.Name : "Собеседник");
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            string msgId = "msg_" + nowMs + "_" + Guid.NewGuid().ToString("N").Substring(0, 6);
+
+            object fileObj = null;
+            if (!string.IsNullOrEmpty(origMsg.PhotoB64))
+            {
+                fileObj = new Dictionary<string, object>
+                {
+                    { "name", "photo.jpg" },
+                    { "type", "image/jpeg" },
+                    { "size", origMsg.PhotoB64.Length },
+                    { "data", "data:image/jpeg;base64," + origMsg.PhotoB64 }
+                };
+            }
+            else if (!string.IsNullOrEmpty(origMsg.FileB64))
+            {
+                string fMime = !string.IsNullOrEmpty(origMsg.FileType) ? origMsg.FileType : "application/octet-stream";
+                fileObj = new Dictionary<string, object>
+                {
+                    { "name", origMsg.FileName ?? "file" },
+                    { "type", fMime },
+                    { "size", origMsg.FileSize },
+                    { "data", "data:" + fMime + ";base64," + origMsg.FileB64 }
+                };
+            }
+
+            var payload = new Dictionary<string, object>
+            {
+                { "id", msgId },
+                { "text", origMsg.Text ?? "" },
+                { "photo", origMsg.PhotoB64 },
+                { "file", fileObj },
+                { "voice", origMsg.VoiceB64 },
+                { "voiceDuration", origMsg.VoiceDuration },
+                { "senderId", identity.Id },
+                { "senderName", identity.Name },
+                { "senderPublicKeyB64", identity.PublicKeyB64 },
+                { "timestamp", nowMs },
+                { "destructSeconds", 0 },
+                { "replyToId", null },
+                { "replyPreviewText", null },
+                { "replySenderName", null },
+                { "forwardedFrom", senderName }
+            };
+
+            if (targetContact.IsGroup)
+            {
+                payload["groupId"] = targetContact.Id;
+                payload["groupName"] = targetContact.Name;
+                await FanOutEnvelopeAsync(targetContact, payload);
+            }
+            else
+            {
+                await SendEnvelopeToContactAsync(targetContact, payload);
+            }
+
+            var newMsg = new MessageModel
+            {
+                Id = msgId,
+                FromMe = true,
+                Text = origMsg.Text ?? "",
+                PhotoB64 = origMsg.PhotoB64,
+                VoiceB64 = origMsg.VoiceB64,
+                VoiceDuration = origMsg.VoiceDuration,
+                FileName = origMsg.FileName,
+                FileSize = origMsg.FileSize,
+                FileType = origMsg.FileType,
+                FileB64 = origMsg.FileB64,
+                Timestamp = nowMs,
+                DestructSeconds = 0,
+                CipherDebug = "Переслано от " + senderName,
+                ForwardedFrom = senderName
+            };
+
+            if (!messages.ContainsKey(targetContact.Id)) messages[targetContact.Id] = new List<MessageModel>();
+            messages[targetContact.Id].Add(newMsg);
+            SaveMessages();
+            NativeAudio.PlaySendSound();
+
+            SelectContact(targetContact);
+            ShowToast("Сообщение переслано в " + targetContact.Name, ToastType.Success);
+        }
+
+        private void NotifyTyping()
+        {
+            if (activeContact == null || webSocket == null || webSocket.State != WebSocketState.Open) return;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (now - lastTypingSentMs < 2500) return;
+            lastTypingSentMs = now;
+
+            if (activeContact.IsGroup && activeContact.MemberIds != null)
+            {
+                foreach (var mId in activeContact.MemberIds)
+                {
+                    if (mId != identity.Id)
+                    {
+                        var tp = new Dictionary<string, object> { { "action", "typing" }, { "to", mId } };
+                        SendRawWebSocket(json.Serialize(tp));
+                    }
+                }
+            }
+            else
+            {
+                var tp = new Dictionary<string, object> { { "action", "typing" }, { "to", activeContact.Id } };
+                SendRawWebSocket(json.Serialize(tp));
+            }
+        }
+
+        private async void SendRawWebSocket(string jsonStr)
+        {
+            try
+            {
+                if (webSocket != null && webSocket.State == WebSocketState.Open)
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(jsonStr);
+                    await webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+            }
+            catch { }
+        }
+
+        private void HandleIncomingTyping(string fromId)
+        {
+            var contact = contacts.Find(delegate(ContactModel c) { return c.Id == fromId; });
+            string senderName = contact != null ? contact.Name : "Собеседник";
+
+            typingContacts.Add(fromId);
+            RenderContactList();
+
+            if (activeContact != null && (activeContact.Id == fromId || (activeContact.IsGroup && activeContact.MemberIds != null && activeContact.MemberIds.Contains(fromId))))
+            {
+                txtActiveStatus.Text = senderName + " печатает...";
+                txtActiveStatus.Foreground = BrushAccentTg;
+            }
+
+            if (typingTimer == null)
+            {
+                typingTimer = new DispatcherTimer();
+                typingTimer.Interval = TimeSpan.FromSeconds(3);
+                typingTimer.Tick += delegate
+                {
+                    typingTimer.Stop();
+                    typingContacts.Remove(fromId);
+                    RenderContactList();
+                    UpdateActiveChatStatus();
+                };
+            }
+            else
+            {
+                typingTimer.Stop();
+            }
+            typingTimer.Start();
         }
 
         private void StartSelfDestruct(MessageModel msg, string contactId, int remainingSeconds = -1)
@@ -4622,10 +5432,23 @@ window.onload = function() {
                     bottomRow.Children.Add(unreadBadge);
                 }
 
+                string preview = string.IsNullOrEmpty(contact.LastMessage) ? "Чат защищен E2EE" : contact.LastMessage;
+                Brush previewColor = isSelected ? new SolidColorBrush(Color.FromArgb(220, 255, 255, 255)) : BrushTextMuted;
+                if (typingContacts.Contains(contact.Id))
+                {
+                    preview = "печатает...";
+                    previewColor = BrushAccentTg;
+                }
+                else if (chatDrafts.ContainsKey(contact.Id) && !string.IsNullOrEmpty(chatDrafts[contact.Id]) && (activeContact == null || activeContact.Id != contact.Id))
+                {
+                    preview = "Черновик: " + chatDrafts[contact.Id];
+                    previewColor = new SolidColorBrush(Color.FromRgb(244, 63, 94));
+                }
+
                 var previewTxt = new TextBlock
                 {
-                    Text = string.IsNullOrEmpty(contact.LastMessage) ? "Чат защищен E2EE" : contact.LastMessage,
-                    Foreground = isSelected ? new SolidColorBrush(Color.FromArgb(220, 255, 255, 255)) : BrushTextMuted,
+                    Text = preview,
+                    Foreground = previewColor,
                     FontSize = 12,
                     TextTrimming = TextTrimming.CharacterEllipsis
                 };
@@ -4644,11 +5467,25 @@ window.onload = function() {
 
         private void SelectContact(ContactModel c)
         {
+            if (activeContact != null && activeContact.Id != c.Id && txtInput != null)
+            {
+                string d = txtInput.Text;
+                if (!string.IsNullOrEmpty(d)) chatDrafts[activeContact.Id] = d;
+                else chatDrafts.Remove(activeContact.Id);
+            }
+
             activeContact = c;
             txtActiveName.Text = c.Name;
             UpdateActiveChatStatus();
             emptyChatPlaceholder.Visibility = Visibility.Collapsed;
             panelMessages.Children.Clear();
+            UpdatePinnedBanner(c.Id);
+            CloseInChatSearch();
+
+            if (txtInput != null)
+            {
+                txtInput.Text = chatDrafts.ContainsKey(c.Id) ? chatDrafts[c.Id] : "";
+            }
 
             // Сбрасываем счетчик непрочитанных для открытого контакта
             if (c.UnreadCount > 0)

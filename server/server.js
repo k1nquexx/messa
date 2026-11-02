@@ -2,15 +2,38 @@
 // СУВЕРЕННЫЙ СЛЕПОЙ РЕЛЕЙ-СЕРВЕР + АВТОМАТИЧЕСКИЙ ИНТЕРНЕТ-ТУННЕЛЬ
 // ==============================================================================
 
+process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT EXCEPTION]:', err ? (err.stack || err.message || err) : 'Unknown');
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[UNHANDLED REJECTION]:', reason);
+});
+
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const QUEUE_DIR = path.join(DATA_DIR, 'offline_queue');
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+
+const MIME_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon',
+    '.webp': 'image/webp'
+};
 
 // Пароль/секрет сервера для доступа "только для своих"
 // Можно задать через переменную окружения CIPHER_SERVER_SECRET или оставить дефолтный для локальных тестов
@@ -20,14 +43,25 @@ const SERVER_SECRET = process.env.CIPHER_SERVER_SECRET || '';
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(QUEUE_DIR)) fs.mkdirSync(QUEUE_DIR, { recursive: true });
 
-let publicTunnelUrl = null;
+let publicTunnelUrl = process.env.PUBLIC_URL || null;
+if (!publicTunnelUrl && process.env.RENDER_EXTERNAL_URL) {
+    publicTunnelUrl = process.env.RENDER_EXTERNAL_URL.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+}
+if (!publicTunnelUrl && process.env.RAILWAY_STATIC_URL) {
+    publicTunnelUrl = `wss://${process.env.RAILWAY_STATIC_URL}`;
+}
 
 // 1. Легковесный API Сервер (без раздачи статики public/, минимальная нагрузка)
 const server = http.createServer((req, res) => {
     const cleanUrl = req.url.split('?')[0];
 
-    // API для получения актуального публичного адреса Cloudflare-туннеля
+    // API для получения актуального публичного адреса сервера/туннеля
     if (cleanUrl === '/api/server-info') {
+        let effectiveTunnelUrl = publicTunnelUrl;
+        if (!effectiveTunnelUrl && req.headers.host && !req.headers.host.includes('localhost') && !req.headers.host.includes('127.0.0.1')) {
+            const proto = (req.headers['x-forwarded-proto'] === 'http' || (!req.headers['x-forwarded-proto'] && req.headers.host.includes(':'))) ? 'ws' : 'wss';
+            effectiveTunnelUrl = `${proto}://${req.headers.host}`;
+        }
         res.writeHead(200, { 
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*'
@@ -35,11 +69,29 @@ const server = http.createServer((req, res) => {
         return res.end(JSON.stringify({
             status: 'online',
             localPort: PORT,
-            tunnelUrl: publicTunnelUrl
+            tunnelUrl: effectiveTunnelUrl
         }));
     }
 
-    if (cleanUrl === '/' || cleanUrl === '/health') {
+    // Быстрое скачивание Android APK напрямую на телефон
+    if (cleanUrl === '/download' || cleanUrl === '/CIPHER.apk') {
+        const apkPath = path.join(__dirname, '..', 'CIPHER.apk');
+        if (fs.existsSync(apkPath)) {
+            const stat = fs.statSync(apkPath);
+            res.writeHead(200, {
+                'Content-Type': 'application/vnd.android.package-archive',
+                'Content-Length': stat.size,
+                'Content-Disposition': 'attachment; filename="CIPHER.apk"',
+                'Access-Control-Allow-Origin': '*'
+            });
+            if (req.method === 'HEAD') {
+                return res.end();
+            }
+            return fs.createReadStream(apkPath).pipe(res);
+        }
+    }
+
+    if (cleanUrl === '/health' || (cleanUrl === '/' && req.headers.accept && req.headers.accept.includes('application/json'))) {
         res.writeHead(200, { 
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*'
@@ -51,8 +103,21 @@ const server = http.createServer((req, res) => {
         }));
     }
 
+    // Раздача автономного интерфейса (public/)
+    const reqPath = cleanUrl === '/' ? 'index.html' : cleanUrl;
+    const safePath = path.normalize(path.join(PUBLIC_DIR, reqPath));
+    if (safePath.startsWith(PUBLIC_DIR) && fs.existsSync(safePath) && fs.statSync(safePath).isFile()) {
+        const ext = path.extname(safePath).toLowerCase();
+        const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+        res.writeHead(200, {
+            'Content-Type': contentType,
+            'Access-Control-Allow-Origin': '*'
+        });
+        return fs.createReadStream(safePath).pipe(res);
+    }
+
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('CIPHER Relay: Static web serving is disabled.');
+    res.end('CIPHER Relay: 404 Not Found');
 });
 
 // 2. Слепой WebSocket релей с сохранением очереди на диск и контролем размера
@@ -310,6 +375,27 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
+                // Сигнализация статуса набора текста ("печатает...")
+                case 'typing': {
+                    if (!authenticatedClientId) return;
+                    const { to } = message;
+                    if (!to) return;
+
+                    const recipientSockets = activeClients.get(to);
+                    if (recipientSockets && recipientSockets.size > 0) {
+                        const typingPacket = JSON.stringify({
+                            action: 'typing',
+                            from: authenticatedClientId
+                        });
+                        for (const sock of recipientSockets) {
+                            if (sock.readyState === ws.OPEN) {
+                                sock.send(typingPacket);
+                            }
+                        }
+                    }
+                    break;
+                }
+
                 default:
                     ws.send(JSON.stringify({ error: 'Неизвестная команда' }));
             }
@@ -380,6 +466,11 @@ setInterval(() => {
 
 // 3. Автоматический запуск Cloudflare Tunnel для доступа из любой точки мира
 function startInternetTunnel() {
+    if (process.env.DISABLE_TUNNEL === 'true' || process.env.RENDER || process.env.RAILWAY_STATIC_URL) {
+        console.log('[TUNNEL] Запуск в постоянном облачном хостинге. Встроенный Cloudflare-туннель отключен.');
+        return;
+    }
+
     const cloudflaredPaths = [
         'C:\\Program Files (x86)\\cloudflared\\cloudflared.exe',
         'C:\\Program Files\\cloudflared\\cloudflared.exe',
@@ -445,6 +536,16 @@ function startInternetTunnel() {
 
     tunnelProc.stdout.on('data', processOutput);
     tunnelProc.stderr.on('data', processOutput);
+
+    tunnelProc.on('error', (err) => {
+        console.error('[TUNNEL ERR]:', err.message);
+    });
+
+    tunnelProc.on('exit', (code) => {
+        console.log(`[TUNNEL] Процесс туннеля завершился с кодом ${code}. Перезапуск через 5 сек...`);
+        publicTunnelUrl = null;
+        setTimeout(startInternetTunnel, 5000);
+    });
 
     process.on('exit', () => {
         try { tunnelProc.kill(); } catch { }

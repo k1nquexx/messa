@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: cipher-messenger
+    env: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server/server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DISABLE_TUNNEL
+        value: "true"
+      - key: CIPHER_SERVER_SECRET
+        sync: false

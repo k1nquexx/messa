@@ -3,6 +3,7 @@
 // ==============================================================================
 
 const SovereignCrypto = require('./crypto');
+const WebSocket = typeof globalThis.WebSocket !== 'undefined' ? globalThis.WebSocket : require('../server/node_modules/ws');
 
 class SovereignClient {
     constructor(name) {

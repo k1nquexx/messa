@@ -1,0 +1,8 @@
+node_modules
+.git
+.idea
+mobile/android/.gradle
+mobile/android/app/build
+mobile/android/build
+CIPHER.exe
+*.log

@@ -15,6 +15,8 @@
     const STORAGE_KEY_CONTACTS = `cipher_contacts_${currentUserProfile}`;
     const STORAGE_KEY_MESSAGES = `cipher_messages_${currentUserProfile}`;
     const STORAGE_KEY_OUTBOX = `cipher_outbox_${currentUserProfile}`;
+    const STORAGE_KEY_PINNED = `cipher_pinned_${currentUserProfile}`;
+    const STORAGE_KEY_DRAFTS = `cipher_drafts_${currentUserProfile}`;
     const STORAGE_KEY_SERVER_URL = 'cipher_server_url';
     const STORAGE_KEY_SERVER_SECRET = 'cipher_server_secret';
 
@@ -148,6 +150,7 @@
     }
 
     let onlineClientIds = new Set();
+    let typingUsers = new Set();
 
     let identity = null;
     let contacts = [];
@@ -155,10 +158,22 @@
     let activeContactId = null;
     let ws = null;
     let reconnectTimeout = null;
+    let connectionWatchdog = null;
+    let wsReconnectDelay = 1500;
     let attachedFile = null; // { name, type, size, data }
     let currentSearchQuery = '';
     let serverTunnelUrl = null;
+    let serverLanUrl = null;
     let replyingMessage = null;
+    let editingMessageId = null;
+    let pinnedMessages = {}; // { [contactId]: messageId }
+    let chatDrafts = {}; // { [contactId]: string }
+    let inChatSearchQuery = '';
+    let inChatSearchMatches = [];
+    let inChatSearchIndex = -1;
+    let typingSendThrottle = 0;
+    let activeForwardMessage = null;
+    let unreadScrolledCount = 0;
 
     // Переменные для записи голосовых сообщений (ГС)
     let mediaRecorder = null;
@@ -200,6 +215,25 @@
     const elDestructTimer = document.getElementById('destruct-timer');
     const elBtnDestructWrapper = document.getElementById('btn-destruct-wrapper');
     const elDestructPillLabel = document.getElementById('destruct-pill-label');
+
+    const elBtnScrollBottom = document.getElementById('btn-scroll-bottom');
+    const elScrollUnreadBadge = document.getElementById('scroll-unread-badge');
+    const elPinnedBar = document.getElementById('pinned-message-bar');
+    const elPinnedSnippet = document.getElementById('pinned-snippet');
+    const elBtnUnpinMessage = document.getElementById('btn-unpin-message');
+    const elInChatSearchBar = document.getElementById('inchat-search-bar');
+    const elInputInChatSearch = document.getElementById('input-inchat-search');
+    const elInChatSearchCount = document.getElementById('inchat-search-count');
+    const elBtnInChatPrev = document.getElementById('btn-inchat-prev');
+    const elBtnInChatNext = document.getElementById('btn-inchat-next');
+    const elBtnInChatClose = document.getElementById('btn-inchat-close');
+    const elBtnSearchInChat = document.getElementById('btn-search-in-chat');
+    const elModalForward = document.getElementById('modal-forward-message');
+    const elBtnCloseForward = document.getElementById('btn-close-forward');
+    const elBtnCancelForward = document.getElementById('btn-cancel-forward');
+    const elForwardPreview = document.getElementById('forward-preview-snippet');
+    const elForwardContactList = document.getElementById('forward-contact-list');
+    const elBtnClearChatHistory = document.getElementById('btn-clear-chat-history');
 
     // Функция переключения между кнопкой отправки и микрофоном (Telegram UX)
     function updateSendButtonVisibility() {
@@ -344,6 +378,18 @@
             outboxQueue = [];
         }
 
+        try {
+            pinnedMessages = (await idbGet(STORAGE_KEY_PINNED)) || {};
+        } catch {
+            pinnedMessages = {};
+        }
+
+        try {
+            chatDrafts = (await idbGet(STORAGE_KEY_DRAFTS)) || {};
+        } catch {
+            chatDrafts = {};
+        }
+
         checkAutoPairing();
         checkInviteLink();
         renderContactList();
@@ -417,9 +463,13 @@
 
     // 4. Определение WebSocket адреса
     function getOptimalWsUrl() {
-        const saved = localStorage.getItem(STORAGE_KEY_SERVER_URL);
+        let saved = localStorage.getItem(STORAGE_KEY_SERVER_URL);
         if (saved && saved.trim() && !saved.includes('localhost') && !saved.includes('127.0.0.1')) {
-            return saved.trim();
+            saved = saved.trim();
+            if (saved.startsWith('http://')) return saved.replace(/^http:\/\//, 'ws://');
+            if (saved.startsWith('https://')) return saved.replace(/^https:\/\//, 'wss://');
+            if (!saved.startsWith('ws://') && !saved.startsWith('wss://')) return 'wss://' + saved;
+            return saved;
         }
 
         if (serverTunnelUrl) {
@@ -431,17 +481,43 @@
         }
 
         if (saved && saved.trim()) {
-            return saved.trim();
+            saved = saved.trim();
+            if (saved.startsWith('http://')) return saved.replace(/^http:\/\//, 'ws://');
+            if (saved.startsWith('https://')) return saved.replace(/^https:\/\//, 'wss://');
+            if (!saved.startsWith('ws://') && !saved.startsWith('wss://')) return 'ws://' + saved;
+            return saved;
         }
 
         return 'ws://127.0.0.1:8080';
     }
 
-    // 5. Подключение к релей-серверу
+    // 5. Подключение к релей-серверу (с защитой от утечек соединений и повторных сокетов)
     function connectWebSocket() {
         if (reconnectTimeout) {
             clearTimeout(reconnectTimeout);
             reconnectTimeout = null;
+        }
+
+        // Если сокет уже подключен или прямо сейчас подключается — не создаем дубликат!
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+
+        // Полное освобождение старого сокета и его обработчиков
+        if (ws) {
+            try {
+                ws.onopen = null;
+                ws.onmessage = null;
+                ws.onerror = null;
+                ws.onclose = null;
+                ws.close();
+            } catch {}
+            ws = null;
+        }
+
+        if (connectionWatchdog) {
+            clearTimeout(connectionWatchdog);
+            connectionWatchdog = null;
         }
 
         const wsUrl = getOptimalWsUrl();
@@ -451,24 +527,31 @@
         elConnectionText.textContent = 'Подключение...';
         elConnectionDot.className = 'pulse-dot';
 
-        let connectionWatchdog = setTimeout(() => {
+        connectionWatchdog = setTimeout(() => {
             if (ws && ws.readyState === WebSocket.CONNECTING) {
                 console.warn('[WS] Таймаут подключения к ' + wsUrl);
                 try { ws.close(); } catch {}
-                onWsError('Таймаут (5 сек)', wsUrl);
+                onWsError('Таймаут (6 сек)', wsUrl);
             }
-        }, 5000);
+        }, 6000);
 
         try {
             ws = new WebSocket(wsUrl);
         } catch (e) {
-            clearTimeout(connectionWatchdog);
+            if (connectionWatchdog) {
+                clearTimeout(connectionWatchdog);
+                connectionWatchdog = null;
+            }
             onWsError(e, wsUrl);
             return;
         }
 
         ws.onopen = () => {
-            clearTimeout(connectionWatchdog);
+            if (connectionWatchdog) {
+                clearTimeout(connectionWatchdog);
+                connectionWatchdog = null;
+            }
+            wsReconnectDelay = 1500;
             console.log('[WS] Подключено к релею:', wsUrl);
             elConnectionDot.className = 'pulse-dot online';
             elConnectionText.textContent = 'В сети';
@@ -501,12 +584,9 @@
                     }
                     renderContactList();
                 } else if (data.action === 'message_read') {
-                    // Обновляем статус сообщения на прочитанное
-                    const msgEl = document.getElementById(`msg_el_${data.messageId}`);
-                    if (msgEl) {
-                        const checkmark = msgEl.querySelector('.msg-status-check');
-                        if (checkmark) checkmark.textContent = '✓✓';
-                    }
+                    handleRemoteReadReceipt(data.messageId);
+                } else if (data.action === 'typing') {
+                    handleIncomingTyping(data.from);
                 } else if (data.action === 'incoming_envelope') {
                     await handleIncomingEnvelope(data.envelope);
                 } else if (data.action === 'call_signal') {
@@ -521,15 +601,29 @@
             }
         };
 
-        ws.onclose = () => onWsError(null, wsUrl);
-        ws.onerror = (err) => onWsError(err, wsUrl);
+        ws.onclose = () => {
+            if (connectionWatchdog) {
+                clearTimeout(connectionWatchdog);
+                connectionWatchdog = null;
+            }
+            onWsError(null, wsUrl);
+        };
+
+        ws.onerror = (err) => {
+            if (connectionWatchdog) {
+                clearTimeout(connectionWatchdog);
+                connectionWatchdog = null;
+            }
+            onWsError(err, wsUrl);
+        };
     }
 
     function onWsError(err, wsUrl) {
         elConnectionDot.className = 'pulse-dot offline';
         elConnectionText.textContent = 'Офлайн';
         if (!reconnectTimeout) {
-            reconnectTimeout = setTimeout(connectWebSocket, 3000);
+            reconnectTimeout = setTimeout(connectWebSocket, wsReconnectDelay);
+            wsReconnectDelay = Math.min(wsReconnectDelay * 1.5, 8000);
         }
     }
 
@@ -561,7 +655,7 @@
                     if (tInfo.lanUrl) {
                         serverLanUrl = tInfo.lanUrl;
                     }
-                    if (!localStorage.getItem(STORAGE_KEY_SERVER_URL) && (!ws || ws.readyState !== WebSocket.OPEN)) {
+                    if (!localStorage.getItem(STORAGE_KEY_SERVER_URL) && (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING))) {
                         connectWebSocket();
                     }
                 }
@@ -665,6 +759,44 @@
                 return;
             }
 
+            // 3. Обработка реакций (Emoji Reactions Telegram style)
+            if (decrypted.type === 'reaction' && decrypted.targetMessageId && decrypted.emoji) {
+                const chatKey = decrypted.groupId || senderId;
+                const msg = (messages[chatKey] || []).find(m => m.id === decrypted.targetMessageId);
+                if (msg) {
+                    if (!msg.reactions) msg.reactions = {};
+                    if (!msg.reactions[decrypted.emoji]) msg.reactions[decrypted.emoji] = [];
+                    const idx = msg.reactions[decrypted.emoji].indexOf(senderId);
+                    if (idx >= 0) {
+                        msg.reactions[decrypted.emoji].splice(idx, 1);
+                        if (msg.reactions[decrypted.emoji].length === 0) {
+                            delete msg.reactions[decrypted.emoji];
+                        }
+                    } else {
+                        msg.reactions[decrypted.emoji].push(senderId);
+                    }
+                    saveMessages();
+                    const rBox = document.getElementById(`reactions_${decrypted.targetMessageId}`);
+                    if (rBox) rBox.innerHTML = renderReactionsHtml(msg.reactions, msg.id);
+                }
+                return;
+            }
+
+            // 4. Обработка закрепления сообщения (Pinned Message Telegram style)
+            if (decrypted.type === 'pin_message') {
+                const chatKey = decrypted.groupId || senderId;
+                if (decrypted.unpin) {
+                    delete pinnedMessages[chatKey];
+                } else if (decrypted.targetMessageId) {
+                    pinnedMessages[chatKey] = decrypted.targetMessageId;
+                }
+                idbSet(STORAGE_KEY_PINNED, pinnedMessages);
+                if (activeContactId === chatKey) {
+                    updatePinnedBanner(chatKey);
+                }
+                return;
+            }
+
             const isGroup = !!decrypted.groupId;
             const chatKey = isGroup ? decrypted.groupId : senderId;
 
@@ -751,7 +883,10 @@
                 cipherDebug: envelope.ciphertext ? envelope.ciphertext.slice(0, 48) + '...' : '',
                 replyToId: decrypted.replyToId || null,
                 replyPreviewText: decrypted.replyPreviewText || null,
-                replySenderName: decrypted.replySenderName || null
+                replySenderName: decrypted.replySenderName || null,
+                reactions: decrypted.reactions || {},
+                forwardedFrom: decrypted.forwardedFrom || null,
+                isRead: (activeContactId === chatKey && !document.hidden)
             };
 
             messages[chatKey].push(msgObj);
@@ -760,6 +895,20 @@
 
             if (activeContactId === chatKey) {
                 appendMessageToUI(msgObj);
+                if (isNearBottom()) {
+                    scrollToBottom(true);
+                } else {
+                    unreadScrolledCount++;
+                    updateScrollBottomButton();
+                }
+
+                if (!document.hidden && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        action: 'read_receipt',
+                        to: senderId,
+                        messageId: msgId
+                    }));
+                }
             }
 
             // Системное Push/Web уведомление при скрытом экране или в неактивном чате
@@ -780,13 +929,14 @@
     }
 
     // 7. Отправка E2EE сообщения / фото / голосового
-    async function sendMessage(text, voicePayload = null) {
+    async function sendMessage(text, voicePayload = null, overrideFile = null, forwardedFrom = null) {
         if (!activeContactId) {
             alert('Пожалуйста, выберите чат из списка слева.');
             return;
         }
 
-        if (!text.trim() && !attachedFile && !voicePayload) {
+        const effFile = overrideFile || attachedFile;
+        if (!text.trim() && !effFile && !voicePayload) {
             return;
         }
 
@@ -883,8 +1033,8 @@
         const payload = {
             id: msgId,
             text: text.trim(),
-            file: attachedFile ? { ...attachedFile } : null,
-            photo: (attachedFile && attachedFile.type && attachedFile.type.startsWith('image/')) ? (attachedFile.data.includes(',') ? attachedFile.data.split(',')[1] : attachedFile.data) : null,
+            file: effFile ? { ...effFile } : null,
+            photo: (effFile && effFile.type && effFile.type.startsWith('image/')) ? (effFile.data.includes(',') ? effFile.data.split(',')[1] : effFile.data) : null,
             voice: voicePayload ? { ...voicePayload } : null,
             voiceDuration: voicePayload ? (voicePayload.duration || 0) : 0,
             senderId: identity.id,
@@ -894,7 +1044,8 @@
             destructSeconds: destructTime,
             replyToId: rToId,
             replyPreviewText: rPrev,
-            replySenderName: rSender
+            replySenderName: rSender,
+            forwardedFrom: forwardedFrom || null
         };
 
         let cipherPreview = '';
@@ -945,7 +1096,7 @@
             id: msgId,
             fromMe: true,
             text: text.trim(),
-            file: attachedFile ? { ...attachedFile } : null,
+            file: effFile ? { ...effFile } : null,
             voice: voicePayload ? { ...voicePayload } : null,
             timestamp: nowMs,
             destructSeconds: destructTime,
@@ -953,6 +1104,8 @@
             replyToId: rToId,
             replyPreviewText: rPrev,
             replySenderName: rSender,
+            reactions: {},
+            forwardedFrom: forwardedFrom || null,
             pending: !isOnline
         };
 
@@ -962,13 +1115,19 @@
         messages[activeContactId].push(msgObj);
         saveMessages();
 
+        delete chatDrafts[activeContactId];
+        idbSet(STORAGE_KEY_DRAFTS, chatDrafts);
+
         appendMessageToUI(msgObj);
+        scrollToBottom(true);
         renderContactList();
 
         playSendSound();
 
         // Сброс прикрепленного файла и панели ответа
-        clearAttachedFile();
+        if (!overrideFile) {
+            clearAttachedFile();
+        }
         clearReply();
 
         if (destructTime > 0) {
@@ -1039,7 +1198,15 @@
             const contactMsgs = messages[contact.id] || [];
             const lastMsg = contactMsgs[contactMsgs.length - 1];
             let lastText = 'Чат защищен E2EE';
-            if (lastMsg) {
+            let isCustomHtml = false;
+
+            if (typingUsers.has(contact.id)) {
+                lastText = '<span class="typing-indicator-row"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span> печатает...</span>';
+                isCustomHtml = true;
+            } else if (chatDrafts[contact.id] && chatDrafts[contact.id].trim() && contact.id !== activeContactId) {
+                lastText = '<span class="chat-draft-preview">Черновик: ' + escapeHtml(chatDrafts[contact.id].trim()) + '</span>';
+                isCustomHtml = true;
+            } else if (lastMsg) {
                 const prefix = lastMsg.fromMe ? 'Вы: ' : '';
                 if (lastMsg.text) {
                     lastText = prefix + lastMsg.text;
@@ -1066,7 +1233,7 @@
                         <span class="chat-item-name">${escapeHtml(contact.name)}</span>
                         <span class="chat-item-time">${lastTime}</span>
                     </div>
-                    <div class="chat-item-preview">${escapeHtml(lastText)}</div>
+                    <div class="chat-item-preview">${isCustomHtml ? lastText : escapeHtml(lastText)}</div>
                 </div>
             `;
 
@@ -1101,7 +1268,26 @@
 
     // 10. Выбор активного диалога
     function selectContact(contactId) {
+        if (activeContactId && activeContactId !== contactId && elMessageInput) {
+            const currentDraft = elMessageInput.value;
+            if (currentDraft && currentDraft.trim()) {
+                chatDrafts[activeContactId] = currentDraft;
+            } else {
+                delete chatDrafts[activeContactId];
+            }
+            idbSet(STORAGE_KEY_DRAFTS, chatDrafts);
+        }
+
+        if (activeAudioPlayer) {
+            try { activeAudioPlayer.pause(); } catch {}
+            activeAudioPlayer = null;
+        }
+
         activeContactId = contactId;
+        unreadScrolledCount = 0;
+        updateScrollBottomButton();
+        closeInChatSearch();
+
         const contact = contacts.find(c => c.id === contactId);
         if (!contact) return;
 
@@ -1120,13 +1306,64 @@
             window.history.pushState({ chat: contactId }, '');
         }
 
+        // Восстановление черновика в поле ввода
+        if (elMessageInput) {
+            elMessageInput.value = chatDrafts[contactId] || '';
+            elMessageInput.style.height = 'auto';
+            if (elMessageInput.value.length > 0) {
+                elMessageInput.style.height = Math.min(elMessageInput.scrollHeight, 120) + 'px';
+            }
+            updateSendButtonVisibility();
+        }
+
+        // Обновление баннера закрепленного сообщения
+        updatePinnedBanner(contactId);
+
         renderContactList();
         renderMessages();
-        elMessageInput.focus();
+
+        // Отправка отчетов о прочтении для непрочитанных входящих
+        const chatList = messages[contactId] || [];
+        let markedRead = false;
+        chatList.forEach(m => {
+            if (!m.fromMe && !m.isRead) {
+                m.isRead = true;
+                markedRead = true;
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        action: 'read_receipt',
+                        to: m.senderId || contactId,
+                        messageId: m.id
+                    }));
+                }
+            }
+        });
+        if (markedRead) saveMessages();
+
+        if (elMessageInput) elMessageInput.focus();
     }
 
     function deselectContact() {
+        if (activeContactId && elMessageInput) {
+            const currentDraft = elMessageInput.value;
+            if (currentDraft && currentDraft.trim()) {
+                chatDrafts[activeContactId] = currentDraft;
+            } else {
+                delete chatDrafts[activeContactId];
+            }
+            idbSet(STORAGE_KEY_DRAFTS, chatDrafts);
+        }
+
+        if (activeAudioPlayer) {
+            try { activeAudioPlayer.pause(); } catch {}
+            activeAudioPlayer = null;
+        }
+
         activeContactId = null;
+        unreadScrolledCount = 0;
+        updateScrollBottomButton();
+        closeInChatSearch();
+
         const appContainer = document.getElementById('app-container');
         if (appContainer) appContainer.classList.remove('has-active-chat');
         elEmptyState.style.display = 'flex';
@@ -1194,7 +1431,10 @@
                         </div>
                         <div class="voice-meta-row">
                             <span id="voice_cur_${msg.id}">0:00</span>
-                            <span>${formatAudioTime(dur)}</span>
+                            <div style="display:flex;align-items:center;gap:6px;">
+                                <span>${formatAudioTime(dur)}</span>
+                                <button type="button" class="voice-speed-btn" onclick="cycleVoiceSpeed('${msg.id}', event)" id="speed_${msg.id}">1x</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1202,6 +1442,7 @@
         }
 
         const textHtml = msg.text ? `<div class="message-text">${escapeHtml(msg.text)}</div>` : '';
+        const forwardedHtml = msg.forwardedFrom ? `<div style="font-size: 11px; font-style: italic; color: #a5b4fc; margin-bottom: 3px;">Переслано от ${escapeHtml(msg.forwardedFrom)}</div>` : '';
 
         // 3. Блок цитирования (Reply / Цитата)
         let replyHtml = '';
@@ -1217,13 +1458,28 @@
             `;
         }
 
+        const quickReactionsHtml = `
+            <div class="quick-reactions-bar">
+                <button type="button" class="quick-reaction-btn" onclick="toggleReaction('${msg.id}', '👍')">👍</button>
+                <button type="button" class="quick-reaction-btn" onclick="toggleReaction('${msg.id}', '❤️')">❤️</button>
+                <button type="button" class="quick-reaction-btn" onclick="toggleReaction('${msg.id}', '🔥')">🔥</button>
+                <button type="button" class="quick-reaction-btn" onclick="toggleReaction('${msg.id}', '👏')">👏</button>
+                <button type="button" class="quick-reaction-btn" onclick="toggleReaction('${msg.id}', '😂')">😂</button>
+                <button type="button" class="quick-reaction-btn" onclick="toggleReaction('${msg.id}', '😮')">😮</button>
+            </div>
+        `;
+        const reactionsHtml = `<div class="message-reactions" id="reactions_${msg.id}">${renderReactionsHtml(msg.reactions, msg.id)}</div>`;
+
         row.innerHTML = `
             <div class="message-bubble">
+                ${quickReactionsHtml}
+                ${forwardedHtml}
                 ${senderTitleHtml}
                 ${replyHtml}
                 ${textHtml}
                 ${fileHtml}
                 ${voiceHtml}
+                ${reactionsHtml}
                 <div class="message-meta">
                     ${burnBadge}
                     ${editedHtml}
@@ -1242,6 +1498,15 @@
             e.stopPropagation();
             setReplyToMessage(msg);
         };
+
+        // Защита от потери скролла при асинхронной загрузке картинок
+        row.querySelectorAll('img').forEach(img => {
+            img.addEventListener('load', () => {
+                if (isNearBottom(250) || msg.fromMe) {
+                    scrollToBottom(false);
+                }
+            }, { once: true });
+        });
 
         // Нативные мобильные жесты (Swipe-to-Reply и Long-Press меню)
         let mTouchStartX = 0, mTouchStartY = 0, mTouchStartTime = 0, mLongPressTimer = null, mMoved = false;
@@ -1293,7 +1558,12 @@
         }, { passive: true });
 
         elMessagesContainer.appendChild(row);
-        scrollToBottom();
+        if (msg.fromMe || isNearBottom()) {
+            scrollToBottom(false);
+        } else {
+            unreadScrolledCount++;
+            updateScrollBottomButton();
+        }
     }
 
     window.toggleCipher = function (id) {
@@ -1303,8 +1573,57 @@
         }
     };
 
-    function scrollToBottom() {
-        elMessagesContainer.scrollTop = elMessagesContainer.scrollHeight;
+    function isNearBottom(threshold = 140) {
+        if (!elMessagesContainer) return true;
+        return (elMessagesContainer.scrollHeight - elMessagesContainer.scrollTop - elMessagesContainer.clientHeight) <= threshold;
+    }
+
+    function scrollToBottom(smooth = false) {
+        if (!elMessagesContainer) return;
+        if (smooth) {
+            elMessagesContainer.scrollTo({ top: elMessagesContainer.scrollHeight, behavior: 'smooth' });
+        } else {
+            elMessagesContainer.scrollTop = elMessagesContainer.scrollHeight;
+        }
+        unreadScrolledCount = 0;
+        updateScrollBottomButton();
+    }
+
+    function updateScrollBottomButton() {
+        if (!elBtnScrollBottom) return;
+        if (isNearBottom(120)) {
+            elBtnScrollBottom.style.display = 'none';
+            unreadScrolledCount = 0;
+            if (elScrollUnreadBadge) elScrollUnreadBadge.style.display = 'none';
+        } else {
+            elBtnScrollBottom.style.display = 'flex';
+            if (elScrollUnreadBadge) {
+                if (unreadScrolledCount > 0) {
+                    elScrollUnreadBadge.textContent = unreadScrolledCount > 99 ? '99+' : unreadScrolledCount;
+                    elScrollUnreadBadge.style.display = 'flex';
+                } else {
+                    elScrollUnreadBadge.style.display = 'none';
+                }
+            }
+        }
+    }
+
+    if (elMessagesContainer) {
+        elMessagesContainer.addEventListener('scroll', updateScrollBottomButton, { passive: true });
+    }
+
+    if (elBtnScrollBottom) {
+        elBtnScrollBottom.addEventListener('click', () => {
+            scrollToBottom(true);
+        });
+    }
+
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', () => {
+            if (activeContactId && isNearBottom(200)) {
+                setTimeout(() => scrollToBottom(false), 50);
+            }
+        });
     }
 
     // ==============================================================================
@@ -1513,6 +1832,11 @@
 
         const audio = new Audio(audioSrc);
         audio.dataset.msgId = msgId;
+        const speedBtn = document.getElementById(`speed_${msgId}`);
+        if (speedBtn) {
+            const sp = parseFloat(speedBtn.textContent) || 1;
+            audio.playbackRate = sp;
+        }
         activeAudioPlayer = audio;
 
         audio.ontimeupdate = () => {
@@ -1697,6 +2021,11 @@
         this.style.height = 'auto';
         this.style.height = Math.min(this.scrollHeight, 120) + 'px';
         updateSendButtonVisibility();
+        notifyTyping();
+        if (activeContactId) {
+            chatDrafts[activeContactId] = this.value;
+            idbSet(STORAGE_KEY_DRAFTS, chatDrafts);
+        }
     });
 
     elMessageInput.addEventListener('keydown', (e) => {
@@ -1947,9 +2276,13 @@
     }
 
     document.getElementById('btn-save-server-settings').onclick = () => {
-        const newUrl = document.getElementById('input-server-ws-url').value.trim();
+        let newUrl = document.getElementById('input-server-ws-url').value.trim();
         const newSecret = document.getElementById('input-server-secret') ? document.getElementById('input-server-secret').value.trim() : '';
         if (newUrl) {
+            if (newUrl.startsWith('http://')) newUrl = newUrl.replace(/^http:\/\//, 'ws://');
+            else if (newUrl.startsWith('https://')) newUrl = newUrl.replace(/^https:\/\//, 'wss://');
+            else if (!newUrl.startsWith('ws://') && !newUrl.startsWith('wss://')) newUrl = 'wss://' + newUrl;
+
             localStorage.setItem(STORAGE_KEY_SERVER_URL, newUrl);
             localStorage.setItem(STORAGE_KEY_SERVER_SECRET, newSecret);
             elModalServerSettings.style.display = 'none';
@@ -2104,10 +2437,33 @@
                 `;
             }
 
+            const isPinned = pinnedMessages[activeContactId] === msgId;
+            const pinItem = `
+                <div class="context-menu-item" onclick="${isPinned ? `unpinMessage('${activeContactId}')` : `pinMessage('${msgId}')`}; closeContextMenu();">
+                    <span class="context-menu-left"><span class="context-menu-icon">📌</span><span>${isPinned ? 'Открепить' : 'Закрепить'}</span></span>
+                </div>
+            `;
+
+            const forwardItem = `
+                <div class="context-menu-item" onclick="openForwardModal('${msgId}'); closeContextMenu();">
+                    <span class="context-menu-left"><span class="context-menu-icon">➡️</span><span>Переслать</span></span>
+                </div>
+            `;
+
             menuHtml = `
+                <div class="context-reactions-row">
+                    <span onclick="toggleReaction('${msgId}', '👍'); closeContextMenu();">👍</span>
+                    <span onclick="toggleReaction('${msgId}', '❤️'); closeContextMenu();">❤️</span>
+                    <span onclick="toggleReaction('${msgId}', '🔥'); closeContextMenu();">🔥</span>
+                    <span onclick="toggleReaction('${msgId}', '👏'); closeContextMenu();">👏</span>
+                    <span onclick="toggleReaction('${msgId}', '😂'); closeContextMenu();">😂</span>
+                    <span onclick="toggleReaction('${msgId}', '😮'); closeContextMenu();">😮</span>
+                </div>
                 <div class="context-menu-item" onclick="window.triggerReply('${msgId}'); closeContextMenu();">
                     <span class="context-menu-left"><span class="context-menu-icon">↩</span><span>Ответить</span></span>
                 </div>
+                ${pinItem}
+                ${forwardItem}
                 ${editItem}
                 <div class="context-menu-item" onclick="copyStringToClipboard('${escapeJsArg(textContent)}'); closeContextMenu();">
                     <span class="context-menu-left"><span class="context-menu-icon">📋</span><span>Копировать текст</span></span>
@@ -2139,6 +2495,9 @@
             menuHtml = `
                 <div class="context-menu-item" onclick="openContactInfoModal(); closeContextMenu();">
                     <span class="context-menu-left"><span class="context-menu-icon">👤</span><span>Профиль контакта</span></span>
+                </div>
+                <div class="context-menu-item" onclick="clearChatHistory(activeContactId || ''); closeContextMenu();">
+                    <span class="context-menu-left"><span class="context-menu-icon">🧹</span><span>Очистить историю</span></span>
                 </div>
                 <div class="context-menu-divider"></div>
                 <div class="context-menu-item danger" onclick="document.getElementById('btn-delete-contact').click(); closeContextMenu();">
@@ -2262,7 +2621,6 @@
         }, { once: true });
     }
 
-    let editingMessageId = null;
     window.startEditMessage = function(msgId) {
         if (!activeContactId || !messages[activeContactId]) return;
         const msg = messages[activeContactId].find(m => m.id === msgId);
@@ -2644,6 +3002,458 @@
             }
         }
     });
+
+    window.hangupCall = hangupCall;
+
+    // ==============================================================================
+    // 19. РЕАКЦИИ И СКОРОСТЬ ГОЛОСОВЫХ СООБЩЕНИЙ (TELEGRAM STYLE)
+    // ==============================================================================
+    function renderReactionsHtml(reactions, msgId) {
+        if (!reactions) return '';
+        const emojis = Object.keys(reactions);
+        if (emojis.length === 0) return '';
+        return emojis.map(emoji => {
+            const users = reactions[emoji] || [];
+            if (!Array.isArray(users) || users.length === 0) return '';
+            const isMy = users.includes(identity ? identity.id : '');
+            return `<span class="reaction-chip ${isMy ? 'my-reaction' : ''}" onclick="window.toggleReaction('${msgId}', '${emoji}')">${emoji} <span class="reaction-count">${users.length}</span></span>`;
+        }).join('');
+    }
+
+    window.toggleReaction = async function(msgId, emoji) {
+        if (!activeContactId || !messages[activeContactId] || !identity) return;
+        const msg = messages[activeContactId].find(m => m.id === msgId);
+        if (!msg) return;
+
+        if (!msg.reactions) msg.reactions = {};
+        if (!Array.isArray(msg.reactions[emoji])) msg.reactions[emoji] = [];
+
+        const myId = identity.id;
+        const idx = msg.reactions[emoji].indexOf(myId);
+        if (idx >= 0) {
+            msg.reactions[emoji].splice(idx, 1);
+            if (msg.reactions[emoji].length === 0) {
+                delete msg.reactions[emoji];
+            }
+        } else {
+            msg.reactions[emoji].push(myId);
+        }
+
+        saveMessages();
+        const rBox = document.getElementById(`reactions_${msgId}`);
+        if (rBox) rBox.innerHTML = renderReactionsHtml(msg.reactions, msgId);
+
+        // Отправка реакции собеседнику / группе
+        const contact = contacts.find(c => c.id === activeContactId);
+        if (!contact) return;
+
+        const reactionPayload = {
+            type: 'reaction',
+            targetMessageId: msgId,
+            emoji: emoji,
+            senderId: myId,
+            senderPublicKeyB64: identity.publicKeyB64,
+            timestamp: Date.now()
+        };
+
+        if (contact.isGroup) {
+            for (const memberId of (contact.memberIds || [])) {
+                if (memberId === myId) continue;
+                const memContact = contacts.find(c => c.id === memberId);
+                if (!memContact || !memContact.publicKeyB64) continue;
+                try {
+                    const env = await WebCryptoE2EE.encryptMessage(memContact.publicKeyB64, reactionPayload);
+                    ws.send(JSON.stringify({ action: 'send_envelope', to: memberId, envelope: env }));
+                } catch (e) {
+                    console.error('Failed to send reaction to group member', e);
+                }
+            }
+        } else if (contact.publicKeyB64) {
+            try {
+                const env = await WebCryptoE2EE.encryptMessage(contact.publicKeyB64, reactionPayload);
+                ws.send(JSON.stringify({ action: 'send_envelope', to: contact.id, envelope: env }));
+            } catch (e) {
+                console.error('Failed to send reaction', e);
+            }
+        }
+    };
+
+    window.cycleVoiceSpeed = function (msgId, event) {
+        if (event) event.stopPropagation();
+        const speeds = [1, 1.5, 2];
+        const speedBtn = document.getElementById(`speed_${msgId}`);
+        const currentSpeed = parseFloat(speedBtn ? speedBtn.textContent : '1') || 1;
+        const nextIndex = (speeds.indexOf(currentSpeed) + 1) % speeds.length;
+        const nextSpeed = speeds[nextIndex];
+        if (speedBtn) speedBtn.textContent = nextSpeed + 'x';
+        if (activeAudioPlayer && activeAudioPlayer.dataset.msgId === msgId) {
+            activeAudioPlayer.playbackRate = nextSpeed;
+        }
+    };
+
+    // ==============================================================================
+    // 20. ЗАКРЕПЛЕННЫЕ СООБЩЕНИЯ (TELEGRAM STYLE)
+    // ==============================================================================
+    function updatePinnedBanner(contactId) {
+        if (!elPinnedBar) return;
+        const pinnedMsgId = pinnedMessages[contactId];
+        if (!pinnedMsgId || !messages[contactId]) {
+            elPinnedBar.style.display = 'none';
+            return;
+        }
+        const msg = messages[contactId].find(m => m.id === pinnedMsgId);
+        if (!msg) {
+            elPinnedBar.style.display = 'none';
+            return;
+        }
+        if (elPinnedSnippet) {
+            elPinnedSnippet.textContent = msg.text || (msg.file ? `[Вложение: ${msg.file.name || 'файл'}]` : (msg.voice ? '[Голосовое сообщение]' : 'Сообщение'));
+        }
+        const contentEl = document.getElementById('pinned-content');
+        if (contentEl) {
+            contentEl.onclick = () => window.jumpToMessage(pinnedMsgId);
+        }
+        if (elBtnUnpinMessage) {
+            elBtnUnpinMessage.onclick = (e) => {
+                e.stopPropagation();
+                window.unpinMessage(contactId);
+            };
+        }
+        elPinnedBar.style.display = 'flex';
+    }
+
+    window.pinMessage = async function(msgId) {
+        if (!activeContactId || !identity) return;
+        pinnedMessages[activeContactId] = msgId;
+        await idbSet(STORAGE_KEY_PINNED, pinnedMessages);
+        updatePinnedBanner(activeContactId);
+
+        const contact = contacts.find(c => c.id === activeContactId);
+        if (!contact) return;
+        const pinPayload = {
+            type: 'pin_message',
+            targetMessageId: msgId,
+            senderId: identity.id,
+            timestamp: Date.now()
+        };
+
+        if (contact.isGroup) {
+            for (const memberId of (contact.memberIds || [])) {
+                if (memberId === identity.id) continue;
+                const mem = contacts.find(c => c.id === memberId);
+                if (!mem || !mem.publicKeyB64) continue;
+                try {
+                    const env = await WebCryptoE2EE.encryptMessage(mem.publicKeyB64, pinPayload);
+                    ws.send(JSON.stringify({ action: 'send_envelope', to: memberId, envelope: env }));
+                } catch {}
+            }
+        } else if (contact.publicKeyB64) {
+            try {
+                const env = await WebCryptoE2EE.encryptMessage(contact.publicKeyB64, pinPayload);
+                ws.send(JSON.stringify({ action: 'send_envelope', to: contact.id, envelope: env }));
+            } catch {}
+        }
+    };
+
+    window.unpinMessage = async function(contactId) {
+        if (!contactId || !identity) return;
+        delete pinnedMessages[contactId];
+        await idbSet(STORAGE_KEY_PINNED, pinnedMessages);
+        updatePinnedBanner(contactId);
+
+        const contact = contacts.find(c => c.id === contactId);
+        if (!contact) return;
+        const unpinPayload = {
+            type: 'pin_message',
+            unpin: true,
+            senderId: identity.id,
+            timestamp: Date.now()
+        };
+
+        if (contact.isGroup) {
+            for (const memberId of (contact.memberIds || [])) {
+                if (memberId === identity.id) continue;
+                const mem = contacts.find(c => c.id === memberId);
+                if (!mem || !mem.publicKeyB64) continue;
+                try {
+                    const env = await WebCryptoE2EE.encryptMessage(mem.publicKeyB64, unpinPayload);
+                    ws.send(JSON.stringify({ action: 'send_envelope', to: memberId, envelope: env }));
+                } catch {}
+            }
+        } else if (contact.publicKeyB64) {
+            try {
+                const env = await WebCryptoE2EE.encryptMessage(contact.publicKeyB64, unpinPayload);
+                ws.send(JSON.stringify({ action: 'send_envelope', to: contact.id, envelope: env }));
+            } catch {}
+        }
+    };
+
+    // ==============================================================================
+    // 21. ПОИСК СООБЩЕНИЙ В АКТИВНОМ ЧАТЕ (TELEGRAM STYLE)
+    // ==============================================================================
+    let inChatSearchResults = [];
+    let currentInChatSearchIndex = -1;
+
+    function openInChatSearch() {
+        if (elInChatSearchBar) elInChatSearchBar.style.display = 'flex';
+        if (elInputInChatSearch) {
+            elInputInChatSearch.value = '';
+            elInputInChatSearch.focus();
+        }
+        performInChatSearch('');
+    }
+
+    function closeInChatSearch() {
+        if (elInChatSearchBar) elInChatSearchBar.style.display = 'none';
+        inChatSearchResults = [];
+        currentInChatSearchIndex = -1;
+        document.querySelectorAll('.search-highlight').forEach(el => {
+            el.classList.remove('search-highlight', 'current');
+        });
+    }
+
+    function performInChatSearch(query) {
+        inChatSearchResults = [];
+        currentInChatSearchIndex = -1;
+        document.querySelectorAll('.search-highlight').forEach(el => {
+            el.classList.remove('search-highlight', 'current');
+        });
+
+        const cleanQuery = (query || '').trim().toLowerCase();
+        if (!cleanQuery || !activeContactId || !messages[activeContactId]) {
+            if (elInChatSearchCount) elInChatSearchCount.textContent = '0 совпадений';
+            return;
+        }
+
+        const msgList = messages[activeContactId];
+        msgList.forEach(m => {
+            if (m.text && m.text.toLowerCase().includes(cleanQuery)) {
+                inChatSearchResults.push(m.id);
+            }
+        });
+
+        if (elInChatSearchCount) {
+            elInChatSearchCount.textContent = `${inChatSearchResults.length} ${inChatSearchResults.length === 1 ? 'совпадение' : (inChatSearchResults.length < 5 ? 'совпадения' : 'совпадений')}`;
+        }
+
+        if (inChatSearchResults.length > 0) {
+            navigateInChatSearch(0);
+        }
+    }
+
+    function navigateInChatSearch(direction) {
+        if (inChatSearchResults.length === 0) return;
+        if (typeof direction === 'number') {
+            currentInChatSearchIndex = direction;
+        } else if (direction === 'prev') {
+            currentInChatSearchIndex = (currentInChatSearchIndex - 1 + inChatSearchResults.length) % inChatSearchResults.length;
+        } else if (direction === 'next') {
+            currentInChatSearchIndex = (currentInChatSearchIndex + 1) % inChatSearchResults.length;
+        }
+
+        const targetId = inChatSearchResults[currentInChatSearchIndex];
+        if (elInChatSearchCount) {
+            elInChatSearchCount.textContent = `${currentInChatSearchIndex + 1} из ${inChatSearchResults.length}`;
+        }
+
+        window.jumpToMessage(targetId);
+        const row = document.getElementById(`msg_el_${targetId}`);
+        if (row) {
+            const textEl = row.querySelector('.message-text');
+            if (textEl) {
+                document.querySelectorAll('.search-highlight.current').forEach(e => e.classList.remove('current'));
+                textEl.classList.add('search-highlight', 'current');
+            }
+        }
+    }
+
+    if (elBtnSearchInChat) elBtnSearchInChat.addEventListener('click', openInChatSearch);
+    if (elBtnInChatClose) elBtnInChatClose.addEventListener('click', closeInChatSearch);
+    if (elBtnInChatPrev) elBtnInChatPrev.addEventListener('click', () => navigateInChatSearch('prev'));
+    if (elBtnInChatNext) elBtnInChatNext.addEventListener('click', () => navigateInChatSearch('next'));
+    if (elInputInChatSearch) {
+        elInputInChatSearch.addEventListener('input', (e) => performInChatSearch(e.target.value));
+        elInputInChatSearch.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                navigateInChatSearch(e.shiftKey ? 'prev' : 'next');
+            } else if (e.key === 'Escape') {
+                closeInChatSearch();
+            }
+        });
+    }
+
+    // ==============================================================================
+    // 22. ПЕРЕСЫЛКА СООБЩЕНИЙ (TELEGRAM STYLE)
+    // ==============================================================================
+    let pendingForwardMsgId = null;
+
+    window.openForwardModal = function(msgId) {
+        if (!activeContactId || !messages[activeContactId]) return;
+        const msg = messages[activeContactId].find(m => m.id === msgId);
+        if (!msg) return;
+
+        pendingForwardMsgId = msgId;
+        if (!elModalForward || !elForwardPreview || !elForwardContactList) return;
+
+        elForwardPreview.textContent = msg.text || (msg.file ? `[Файл: ${msg.file.name}]` : (msg.voice ? '[Голосовое сообщение]' : 'Вложение'));
+        elForwardContactList.innerHTML = '';
+
+        contacts.forEach(c => {
+            const row = document.createElement('div');
+            row.className = 'forward-contact-row';
+            row.innerHTML = `
+                <div class="avatar" style="width: 32px; height: 32px; font-size: 14px; background: ${getColorFromHash(c.id)};">${escapeHtml(c.name[0].toUpperCase())}</div>
+                <div style="font-weight: 500;">${escapeHtml(c.name)}</div>
+            `;
+            row.onclick = () => {
+                forwardMessageTo(c.id);
+                closeForwardModal();
+            };
+            elForwardContactList.appendChild(row);
+        });
+
+        elModalForward.style.display = 'flex';
+    };
+
+    function closeForwardModal() {
+        if (elModalForward) elModalForward.style.display = 'none';
+        pendingForwardMsgId = null;
+    }
+
+    if (elBtnCloseForward) elBtnCloseForward.addEventListener('click', closeForwardModal);
+    if (elBtnCancelForward) elBtnCancelForward.addEventListener('click', closeForwardModal);
+
+    async function forwardMessageTo(targetContactId) {
+        if (!pendingForwardMsgId || !activeContactId || !messages[activeContactId]) return;
+        const origMsg = messages[activeContactId].find(m => m.id === pendingForwardMsgId);
+        if (!origMsg) return;
+
+        const originalSender = origMsg.fromMe ? 'Вы' : (contacts.find(c => c.id === activeContactId)?.name || 'Собеседник');
+        const contact = contacts.find(c => c.id === targetContactId);
+        if (!contact) return;
+
+        // Переключаемся в целевой чат
+        selectContact(targetContactId);
+
+        // Отправляем пересланное сообщение
+        sendMessage(origMsg.text || '', origMsg.voice || null, origMsg.file || null, originalSender);
+    }
+
+    // ==============================================================================
+    // 23. ОЧИСТКА ИСТОРИИ, СТАТУС НАБОРА И ОТЧЕТЫ О ПРОЧТЕНИИ
+    // ==============================================================================
+    window.clearChatHistory = function(contactId) {
+        if (!contactId) return;
+        if (!confirm('Вы действительно хотите очистить историю этого чата? Все сообщения будут стерты.')) return;
+        messages[contactId] = [];
+        delete pinnedMessages[contactId];
+        delete chatDrafts[contactId];
+        saveMessages();
+        idbSet(STORAGE_KEY_PINNED, pinnedMessages);
+        idbSet(STORAGE_KEY_DRAFTS, chatDrafts);
+
+        if (activeContactId === contactId) {
+            renderMessages();
+            updatePinnedBanner(contactId);
+        }
+        renderContactList();
+        const contactModal = document.getElementById('modal-contact-info');
+        if (contactModal) contactModal.style.display = 'none';
+    };
+
+    if (elBtnClearChatHistory) {
+        elBtnClearChatHistory.addEventListener('click', () => {
+            if (activeContactId) {
+                window.clearChatHistory(activeContactId);
+            }
+        });
+    }
+
+    let lastTypingSentTs = 0;
+    let typingTimer = null;
+
+    function notifyTyping() {
+        if (!activeContactId || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const now = Date.now();
+        if (now - lastTypingSentTs < 2500) return;
+        lastTypingSentTs = now;
+
+        const contact = contacts.find(c => c.id === activeContactId);
+        if (!contact) return;
+
+        if (contact.isGroup) {
+            (contact.memberIds || []).forEach(mId => {
+                if (mId !== (identity ? identity.id : '')) {
+                    ws.send(JSON.stringify({ action: 'typing', to: mId }));
+                }
+            });
+        } else {
+            ws.send(JSON.stringify({ action: 'typing', to: contact.id }));
+        }
+    }
+
+    function handleIncomingTyping(senderId) {
+        if (!contacts || contacts.length === 0) return;
+        const typingContact = contacts.find(c => c.isGroup ? (c.memberIds || []).includes(senderId) : c.id === senderId);
+        if (typingContact) {
+            typingUsers.add(typingContact.id);
+            renderContactList();
+        }
+
+        if (!activeContactId) return;
+        const contact = contacts.find(c => c.id === activeContactId);
+        if (!contact) return;
+
+        const isCurrentChat = contact.isGroup ? (contact.memberIds || []).includes(senderId) : activeContactId === senderId;
+        if (!isCurrentChat) return;
+
+        const sender = contacts.find(c => c.id === senderId);
+        const name = sender ? sender.name : 'Собеседник';
+
+        const statusText = document.querySelector('.contact-status-text');
+        if (statusText) {
+            statusText.textContent = `${name} печатает...`;
+            statusText.style.color = 'var(--primary)';
+        }
+
+        const typingRow = document.getElementById('chat-typing-row');
+        if (typingRow) {
+            typingRow.innerHTML = `<span>${escapeHtml(name)} печатает</span><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>`;
+            typingRow.style.display = 'flex';
+        }
+
+        if (typingTimer) clearTimeout(typingTimer);
+        typingTimer = setTimeout(() => {
+            if (typingContact) {
+                typingUsers.delete(typingContact.id);
+                renderContactList();
+            }
+            if (statusText) {
+                statusText.textContent = 'Сквозной шифр активен • Сервер слеп';
+                statusText.style.color = '';
+            }
+            if (typingRow) {
+                typingRow.style.display = 'none';
+            }
+        }, 3000);
+    }
+
+    function handleRemoteReadReceipt(messageId) {
+        if (!messageId) return;
+        for (const cId in messages) {
+            const msg = messages[cId].find(m => m.id === messageId);
+            if (msg) {
+                msg.isRead = true;
+                saveMessages();
+                const statusEl = document.getElementById(`status_${messageId}`);
+                if (statusEl) {
+                    statusEl.textContent = '✓✓';
+                    statusEl.style.color = '#38bdf8';
+                }
+                break;
+            }
+        }
+    }
 
     function escapeJsArg(str) {
         return (str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '');
